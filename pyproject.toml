@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vigil-agent"
+version = "0.1.0"
+description = "Autonomous AI coding agent that continuously improves your codebase"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    {name = "Vigil Contributors"}
+]
+keywords = ["ai", "agent", "autonomous", "code-improvement", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "pydantic>=2.10.0",
+    "pyyaml>=6.0",
+    "requests>=2.32.0",
+    "websockets>=14.0",
+    "sqlalchemy>=2.0",
+    "aiosqlite>=0.19.0",
+    "greenlet>=3.0.0",
+]
+
+[project.optional-dependencies]
+postgres = [
+    "asyncpg>=0.29.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+vigil = "vigil.cli:main"
+
+[project.urls]
+homepage = "https://github.com/chiranjeevg/vigil"
+documentation = "https://github.com/chiranjeevg/vigil#readme"
+repository = "https://github.com/chiranjeevg/vigil"
+issues = "https://github.com/chiranjeevg/vigil/issues"
+
+[tool.setuptools.packages.find]
+include = ["vigil*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

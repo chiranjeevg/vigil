@@ -1,0 +1,129 @@
+# Vigil Configuration
+# Copy this file to vigil.yaml and customize for your project.
+
+project:
+  # Absolute path to your project
+  path: /path/to/your/project
+  # Programming language: java, python, cpp, rust, go, typescript, auto
+  language: auto
+  # Display name
+  name: "My Project"
+  # Paths to include (relative to project root)
+  include_paths:
+    - "src/"
+    - "test/"
+    - "tests/"
+  # Paths to exclude
+  exclude_paths:
+    - "node_modules/"
+    - "venv/"
+    - ".git/"
+    - "build/"
+    - "dist/"
+
+provider:
+  # LLM provider: ollama, openai
+  type: ollama
+  # Model name
+  model: qwen2.5-coder:14b
+  # API base URL
+  base_url: http://localhost:11434
+  # Max tokens per response
+  max_tokens: 8192
+  # Temperature (lower = more deterministic)
+  temperature: 0.2
+  # For OpenAI / API-key providers, set env var name:
+  # api_key_env: OPENAI_API_KEY
+
+  # Deep analysis tuning (all optional — auto-detected from provider + model).
+  # Profiles: auto, api_fast, local_large, local_small
+  # deep_analysis:
+  #   profile: auto                    # auto-detected from provider type + model size
+  #   max_investigation_targets: 3     # areas to investigate (api_fast=5, local_large=3, local_small=2)
+  #   max_repo_map_chars: 4000         # repo map context sent to LLM
+  #   max_file_chars: 2500             # max chars per source file in prompts
+  #   timeout_seconds: 180             # per-LLM-call timeout
+  #   disable_thinking: auto           # auto | true | false — disables CoT for qwen3/deepseek-r1
+  #   parallel_workers: 2              # concurrent Phase 3 investigations
+  #   phase2_max_tokens: 2000          # max output tokens for architecture analysis
+  #   phase3_max_tokens: 2000          # max output tokens per code investigation
+  #   phase4_max_tokens: 3000          # max output tokens for task synthesis
+
+tests:
+  # Command to run tests
+  command: "pytest"
+  # Test timeout in seconds
+  timeout: 300
+  coverage:
+    enabled: false
+    command: "pytest --cov"
+    report_path: "coverage.xml"
+    format: "auto"
+    # Target coverage percentage
+    target: 90
+
+benchmarks:
+  enabled: false
+  command: ""
+  timeout: 600
+  results_path: ""
+  format: "auto"
+  # Revert changes if benchmark regresses by more than this %
+  regression_threshold: -2.0
+  # Run benchmarks every N iterations
+  run_every: 3
+
+tasks:
+  # Task priority order (top = highest priority)
+  priorities:
+    - fix_tests
+    - run_benchmarks
+    - test_coverage
+    - optimize_performance
+    - modernize_code
+    - reduce_complexity
+    - fix_warnings
+    - refactor
+  # Custom tasks
+  custom: []
+  # Per-task instructions for the LLM
+  instructions: {}
+
+controls:
+  max_iterations_per_day: 200
+  sleep_between_iterations: 30
+  sleep_after_failure: 60
+  max_consecutive_no_improvement: 10
+  work_branch: "vigil-improvements"
+  auto_commit: true
+  commit_prefix: "vigil"
+  max_files_per_iteration: 5
+  max_lines_changed: 200
+  require_test_pass: true
+  dry_run: false
+  pause_on_battery: true
+
+api:
+  enabled: true
+  host: "127.0.0.1"
+  port: 7420
+
+# Pull Request workflow — per-iteration vigil/* branches; optional GitHub PR
+pr:
+  # When true: each iteration uses a local branch vigil/<task>-<n> forked from base_branch.
+  # Push + `gh pr create` only run if a git remote exists and `gh auth login` was done.
+  enabled: false
+  # Strategy: per_iteration creates one PR per successful change
+  strategy: "per_iteration"
+  # Target branch for PRs
+  base_branch: "main"
+  # Automatically push and create PR after tests pass
+  auto_push: true
+  # Labels to apply to created PRs
+  labels:
+    - "vigil"
+    - "automated"
+  # GitHub usernames to request review from
+  reviewers: []
+  # Use LLM to generate PR description (vs. static template)
+  use_llm_description: true
