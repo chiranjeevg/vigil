@@ -435,7 +435,16 @@ def _run_phase2(
         todo_sample=todo_sample,
     )
 
-    yield _emit("log", {"msg": f"Phase 2: Sending {len(user_prompt)} chars to LLM...", "level": "detail"})
+    yield _emit(
+        "log",
+        {
+            "msg": (
+                f"Phase 2: Sending {len(user_prompt)} characters in user prompt "
+                f"(character count, not tokens)"
+            ),
+            "level": "detail",
+        },
+    )
 
     try:
         t0 = time.time()

@@ -48,6 +48,11 @@ function withNormalizedPr(config: VigilConfig): VigilConfig {
     min_improvement_threshold: d.min_improvement_threshold ?? 0.1,
     commit_prefix: d.commit_prefix ?? "vigil",
     require_test_pass: d.require_test_pass ?? true,
+    stop_on_llm_error: d.stop_on_llm_error ?? true,
+    max_files_per_iteration:
+      d.max_files_per_iteration === undefined ? 5 : d.max_files_per_iteration,
+    max_lines_changed:
+      d.max_lines_changed === undefined ? 200 : d.max_lines_changed,
   };
   return c;
 }
@@ -797,30 +802,42 @@ export function Settings() {
           <Field label="Max Files Per Iteration">
             <input
               type="number"
-              value={draft.controls.max_files_per_iteration}
-              onChange={(e) =>
+              min={1}
+              value={draft.controls.max_files_per_iteration ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
                 update(
                   "controls",
                   "max_files_per_iteration",
-                  Number(e.target.value),
-                )
-              }
+                  v === "" ? null : Number(v),
+                );
+              }}
               className={inputClass}
+              placeholder="Unlimited if empty"
             />
+            <p className="mt-1 text-xs text-slate-500">
+              Leave empty for no limit (large refactors). Otherwise max files touched per iteration.
+            </p>
           </Field>
           <Field label="Max Lines Changed">
             <input
               type="number"
-              value={draft.controls.max_lines_changed}
-              onChange={(e) =>
+              min={1}
+              value={draft.controls.max_lines_changed ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
                 update(
                   "controls",
                   "max_lines_changed",
-                  Number(e.target.value),
-                )
-              }
+                  v === "" ? null : Number(v),
+                );
+              }}
               className={inputClass}
+              placeholder="Unlimited if empty"
             />
+            <p className="mt-1 text-xs text-slate-500">
+              Leave empty for no limit. Otherwise cap on the SEARCH+REPLACE line metric per iteration.
+            </p>
           </Field>
 
           <div className="col-span-full grid grid-cols-2 gap-4 md:grid-cols-4">
@@ -830,6 +847,7 @@ export function Settings() {
                 ["require_test_pass", "Require tests to pass"],
                 ["pause_on_battery", "Pause on battery"],
                 ["dry_run", "Dry run"],
+                ["stop_on_llm_error", "Stop on LLM error"],
               ] as const
             ).map(([key, label]) => (
               <Field key={key} label={label}>

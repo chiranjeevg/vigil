@@ -26,14 +26,18 @@ provider:
   type: ollama
   # Model name
   model: qwen2.5-coder:14b
-  # API base URL
+  # API base URL (no trailing /v1 — Vigil adds /v1/chat/completions for type: openai)
   base_url: http://localhost:11434
   # Max tokens per response
   max_tokens: 8192
   # Temperature (lower = more deterministic)
   temperature: 0.2
-  # For OpenAI / API-key providers, set env var name:
+  # For OpenAI-compatible APIs (OpenAI, Groq, local proxy, Cursor gateway on :4000):
+  # type: openai
+  # model: gpt-4
+  # base_url: http://localhost:4000
   # api_key_env: OPENAI_API_KEY
+  # Then: export OPENAI_API_KEY=dummy   # or a real key if required
 
   # Deep analysis tuning (all optional — auto-detected from provider + model).
   # Profiles: auto, api_fast, local_large, local_small
@@ -94,11 +98,17 @@ controls:
   sleep_between_iterations: 30
   sleep_after_failure: 60
   max_consecutive_no_improvement: 10
+  # Stop the daemon after a failed LLM request (avoids infinite retry on bad provider).
+  stop_on_llm_error: true
   work_branch: "vigil-improvements"
   auto_commit: true
   commit_prefix: "vigil"
+  # Safety caps on edit size per iteration. Use null for no limit on that axis (use with care).
   max_files_per_iteration: 5
   max_lines_changed: 200
+  # Example — unlimited files, still cap lines:
+  # max_files_per_iteration: null
+  # max_lines_changed: 500
   require_test_pass: true
   dry_run: false
   pause_on_battery: true

@@ -10,6 +10,7 @@ import {
   FolderOpen,
   Loader2,
   Sparkles,
+  StopCircle,
   Terminal,
 } from "lucide-react";
 import clsx from "clsx";
@@ -112,6 +113,11 @@ export function Tasks() {
     setTimeout(() => logEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
   }, []);
 
+  function abortAISuggestions() {
+    abortRef.current?.abort();
+    abortRef.current = null;
+  }
+
   function refreshAISuggestions() {
     if (!taskPathForAI) return;
 
@@ -147,9 +153,16 @@ export function Tasks() {
           const d = evt.data as { suggested?: SuggestedTask[]; llm_enhanced?: boolean };
           setAiSuggested(d.suggested ?? []);
           setLlmEnhanced(d.llm_enhanced ?? false);
+          setAiLoading(false);
+          setAiPhase("Complete");
+        } else if (evt.type === "done") {
+          setAiLoading(false);
+          setAiPhase("Complete");
         } else if (evt.type === "error") {
           const d = evt.data as { msg?: string };
           appendLog(`ERROR: ${d.msg}`);
+          setAiLoading(false);
+          setAiPhase("Failed");
         }
       },
       (err) => {
@@ -159,7 +172,12 @@ export function Tasks() {
       },
       () => {
         setAiLoading(false);
-        if (!aiPhase || aiPhase === "Starting deep analysis…") setAiPhase("Complete");
+        setAiPhase("Complete");
+      },
+      () => {
+        appendLog("Cancelled — analysis stopped.");
+        setAiLoading(false);
+        setAiPhase("Cancelled");
       },
     );
 
@@ -337,6 +355,16 @@ export function Tasks() {
                     )}
                     {aiLoading ? "Deep analysis…" : "Refresh with AI"}
                   </button>
+                  {aiLoading && (
+                    <button
+                      type="button"
+                      onClick={abortAISuggestions}
+                      className="inline-flex items-center gap-2 rounded-lg border border-red-400/60 bg-red-50 px-3 py-2 text-sm font-medium text-red-800 transition-colors hover:bg-red-100 dark:border-red-500/40 dark:bg-red-950/40 dark:text-red-200 dark:hover:bg-red-900/50"
+                    >
+                      <StopCircle className="h-4 w-4" />
+                      Abort
+                    </button>
+                  )}
                   {aiSuggested.length > 0 && (
                     <button
                       type="button"

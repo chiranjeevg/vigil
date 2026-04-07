@@ -272,6 +272,16 @@ class Orchestrator:
                 llm_prompt_system=system_prompt,
                 llm_prompt_user=user_prompt,
             )
+            if self.config.controls.stop_on_llm_error:
+                log.warning(
+                    "Stopping Vigil after LLM error (controls.stop_on_llm_error). "
+                    "Fix the provider or set stop_on_llm_error: false in vigil.yaml to retry."
+                )
+                self._running = False
+                self._broadcast(
+                    "orchestrator_stop",
+                    {"reason": "llm_error", "message": str(e)},
+                )
             return
 
         analysis_text = ""
@@ -327,15 +337,21 @@ class Orchestrator:
             return
 
         ilog.begin_step("Validating change size")
-        if not self.applier.validate_changes(
+        ok, validation_msg = self.applier.validate_changes(
             changes,
             self.config.controls.max_files_per_iteration,
             self.config.controls.max_lines_changed,
-        ):
-            ilog.end_step("FAILED — too many changes, reverting")
+        )
+        if not ok:
+            ilog.end_step(validation_msg)
             self.git.revert_all()
+            ilog.add_step(
+                "Working tree reverted",
+                "All edits from this iteration were discarded so the repo matches the pre-iteration state.",
+            )
             _finalize_failure(
-                "safety_revert", "Too many changes",
+                "safety_revert",
+                validation_msg,
                 llm_response=response.text,
                 llm_prompt_system=system_prompt,
                 llm_prompt_user=user_prompt,

@@ -8,7 +8,7 @@ from enum import Enum
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +39,19 @@ def _is_thinking_model(model: str) -> bool:
 
 
 def _is_local_provider(provider: "ProviderConfig") -> bool:
+    """True only for on-machine inference (Ollama / typical local stacks).
+
+    ``type: openai`` uses the OpenAI HTTP API shape; ``base_url`` is often
+    ``http://localhost:...`` for proxies (Cursor gateway, LiteLLM, vLLM, etc.).
+    Those must **not** be classified as "local" for deep-analysis auto-detect,
+    or we wrongly apply ``local_*`` caps (small repo map, few workers) instead of
+    ``api_fast``. Users running a tiny local OpenAI-compat server can set
+    ``deep_analysis.profile`` explicitly.
+    """
     if provider.type == "ollama":
         return True
+    if provider.type == "openai":
+        return False
     url = provider.base_url.lower()
     return "localhost" in url or "127.0.0.1" in url
 
@@ -250,15 +261,30 @@ class ControlsConfig(BaseModel):
     sleep_between_iterations: int = 30
     sleep_after_failure: int = 60
     max_consecutive_no_improvement: int = 10
+    # Stop daemon after LLM failure instead of retrying until focus shifts.
+    stop_on_llm_error: bool = True
     min_improvement_threshold: float = 0.1
     work_branch: str = "vigil-improvements"
     auto_commit: bool = True
     commit_prefix: str = "vigil"
-    max_files_per_iteration: int = 5
-    max_lines_changed: int = 200
+    # Omitted key defaults to 5 / 200. Set key to null in YAML for no limit on that axis.
+    max_files_per_iteration: int | None = Field(default=5)
+    max_lines_changed: int | None = Field(default=200)
     require_test_pass: bool = True
     dry_run: bool = False
     pause_on_battery: bool = True
+
+    @field_validator("max_files_per_iteration", "max_lines_changed", mode="before")
+    @classmethod
+    def _unlimited_or_positive(cls, v: object) -> object:
+        """YAML `null` disables that safety cap; integers must be >= 1."""
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("expected int or null")
+        if isinstance(v, int) and v < 1:
+            raise ValueError("must be >= 1 or null for unlimited")
+        return v
 
 
 class NotificationsConfig(BaseModel):

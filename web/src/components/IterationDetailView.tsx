@@ -199,7 +199,9 @@ export function IterationDetailView({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3 rounded-lg bg-slate-100/90 px-4 py-3 dark:bg-slate-800/40">
-        <span className="text-sm text-slate-800 dark:text-slate-300">{it.summary}</span>
+        <span className="max-w-full whitespace-pre-wrap break-words text-sm text-slate-800 dark:text-slate-300">
+          {it.summary}
+        </span>
         <div className="ml-auto flex flex-wrap items-center gap-3 text-[11px] text-slate-600 dark:text-slate-500">
           {it.provider_name && (
             <span className="flex items-center gap-1 rounded bg-slate-200 px-1.5 py-0.5 text-slate-700 dark:bg-slate-700/50 dark:text-slate-400">

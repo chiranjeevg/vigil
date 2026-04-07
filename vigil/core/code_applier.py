@@ -200,13 +200,56 @@ class CodeApplier:
         return oi
 
     def validate_changes(
-        self, changes: list[dict], max_files: int, max_lines: int
-    ) -> bool:
-        if len(changes) > max_files:
-            log.warning("Too many files changed: %d > %d", len(changes), max_files)
-            return False
+        self,
+        changes: list[dict],
+        max_files: int | None,
+        max_lines: int | None,
+    ) -> tuple[bool, str]:
+        """Return (ok, message). On failure, message explains which limit broke and how to fix it.
+
+        ``max_files`` or ``max_lines`` of ``None`` disables that check (no limit).
+        """
+        n_files = len(changes)
+        if max_files is not None and n_files > max_files:
+            log.warning("Too many files changed: %d > %d", n_files, max_files)
+            preview = self._format_files_preview(changes, limit=20)
+            msg = (
+                f"Safety limit exceeded: {n_files} files were modified but "
+                f"controls.max_files_per_iteration is {max_files}.\n\n"
+                f"Modified paths: {preview}\n\n"
+                "Increase max_files_per_iteration in vigil.yaml (Settings → Git & iteration controls) "
+                "if a larger batch is intentional, or ask the model to touch fewer files per iteration."
+            )
+            return False, msg
+
         total_lines = sum(c.get("lines_changed", 0) for c in changes)
-        if total_lines > max_lines:
+        if max_lines is not None and total_lines > max_lines:
             log.warning("Too many lines changed: %d > %d", total_lines, max_lines)
-            return False
-        return True
+            by_file = sorted(
+                changes,
+                key=lambda c: c.get("lines_changed", 0),
+                reverse=True,
+            )
+            parts = [f"{c['file']} (~{c.get('lines_changed', 0)} lines)" for c in by_file[:20]]
+            tail = ""
+            if len(by_file) > 20:
+                tail = f"\n… and {len(by_file) - 20} more files"
+            msg = (
+                f"Safety limit exceeded: estimated lines touched is {total_lines} but "
+                f"controls.max_lines_changed is {max_lines}.\n\n"
+                "(Line counts are per SEARCH/REPLACE block: search lines + replace lines — "
+                "an upper bound on edit size.)\n\n"
+                f"Largest edits: {', '.join(parts)}{tail}\n\n"
+                "Increase max_lines_changed in vigil.yaml if appropriate, or split work into smaller tasks."
+            )
+            return False, msg
+
+        return True, ""
+
+    @staticmethod
+    def _format_files_preview(changes: list[dict], *, limit: int) -> str:
+        files = [c.get("file", "?") for c in changes]
+        if len(files) <= limit:
+            return ", ".join(files)
+        head = ", ".join(files[:limit])
+        return f"{head}, … (+{len(files) - limit} more)"

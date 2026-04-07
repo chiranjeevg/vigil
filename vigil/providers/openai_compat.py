@@ -7,7 +7,7 @@ import time
 import requests
 
 from vigil.config import ProviderConfig
-from vigil.providers.base import BaseProvider, LLMResponse
+from vigil.providers.base import BaseProvider, LLMResponse, sanitize_llm_text
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,8 @@ class OpenAICompatProvider(BaseProvider):
                 )
 
     def complete(self, system_prompt: str, user_prompt: str) -> LLMResponse:
+        system_prompt = sanitize_llm_text(system_prompt)
+        user_prompt = sanitize_llm_text(user_prompt)
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"

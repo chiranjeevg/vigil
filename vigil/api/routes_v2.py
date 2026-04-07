@@ -1,5 +1,6 @@
 """API routes v2 - Database-backed endpoints for Vigil."""
 
+import asyncio
 import json
 import logging
 import os
@@ -9,7 +10,7 @@ from typing import Any, Optional
 
 import requests as http_requests
 import yaml
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -858,8 +859,11 @@ def analyze_stream_endpoint(req: AnalyzeRequest):
 
 
 @router.post("/setup/deep-suggest-stream")
-def deep_suggest_stream_endpoint(req: AnalyzeRequest):
-    """SSE stream of deep analysis progress — 4-phase pipeline with live updates."""
+async def deep_suggest_stream_endpoint(req: AnalyzeRequest, request: Request):
+    """SSE stream of deep analysis progress — 4-phase pipeline with live updates.
+
+    Stops when the client disconnects (e.g. user clicks Abort in the UI).
+    """
     from vigil.core.deep_suggest import deep_suggest_tasks
 
     if not os.path.isdir(req.path):
@@ -871,10 +875,23 @@ def deep_suggest_stream_endpoint(req: AnalyzeRequest):
 
     p_config = _config.provider if _config else None
 
-    def event_generator():
-        for event_type, data in deep_suggest_tasks(req.path, provider, provider_config=p_config):
-            payload = json.dumps({"type": event_type, "data": data})
-            yield f"data: {payload}\n\n"
+    async def event_generator():
+        gen = deep_suggest_tasks(req.path, provider, provider_config=p_config)
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event_type, data = await asyncio.to_thread(next, gen)
+                except StopIteration:
+                    break
+                payload = json.dumps({"type": event_type, "data": data})
+                yield f"data: {payload}\n\n"
+        finally:
+            try:
+                gen.close()
+            except RuntimeError:
+                pass
 
     return StreamingResponse(
         event_generator(),

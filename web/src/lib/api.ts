@@ -52,6 +52,7 @@ export function streamDeepSuggest(
   onEvent: (evt: DeepSuggestEvent) => void,
   onError: (err: Error) => void,
   onDone: () => void,
+  onAbort?: () => void,
 ): AbortController {
   const controller = new AbortController();
 
@@ -72,6 +73,16 @@ export function streamDeepSuggest(
       const decoder = new TextDecoder();
       let buffer = "";
 
+      const emitLine = (trimmed: string) => {
+        if (!trimmed.startsWith("data: ")) return;
+        try {
+          const parsed = JSON.parse(trimmed.slice(6)) as DeepSuggestEvent;
+          onEvent(parsed);
+        } catch {
+          // skip malformed SSE lines
+        }
+      };
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -81,21 +92,23 @@ export function streamDeepSuggest(
         buffer = lines.pop() ?? "";
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("data: ")) {
-            try {
-              const parsed = JSON.parse(trimmed.slice(6)) as DeepSuggestEvent;
-              onEvent(parsed);
-            } catch {
-              // skip malformed SSE lines
-            }
-          }
+          emitLine(line.trim());
         }
       }
+
+      // Flush decoder (multibyte UTF-8) and last line that may lack a trailing newline.
+      buffer += decoder.decode();
+      for (const line of buffer.split("\n")) {
+        emitLine(line.trim());
+      }
+
       onDone();
     })
     .catch((err: unknown) => {
-      if (err instanceof DOMException && err.name === "AbortError") return;
+      if (err instanceof DOMException && err.name === "AbortError") {
+        onAbort?.();
+        return;
+      }
       onError(err instanceof Error ? err : new Error(String(err)));
     });
 

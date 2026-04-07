@@ -143,14 +143,18 @@ export interface ControlsConfig {
   sleep_between_iterations: number;
   sleep_after_failure: number;
   max_consecutive_no_improvement: number;
+  /** If true, stop the daemon after a failed LLM call instead of retrying indefinitely. */
+  stop_on_llm_error: boolean;
   min_improvement_threshold: number;
   /** Persistent branch Vigil uses between iterations (iteration branches are created from this). */
   work_branch: string;
   /** Prefix for auto-generated commit messages */
   commit_prefix: string;
   auto_commit: boolean;
-  max_files_per_iteration: number;
-  max_lines_changed: number;
+  /** null = no limit on file count for that iteration */
+  max_files_per_iteration: number | null;
+  /** null = no limit on aggregate line metric for that iteration */
+  max_lines_changed: number | null;
   require_test_pass: boolean;
   pause_on_battery: boolean;
   dry_run: boolean;
