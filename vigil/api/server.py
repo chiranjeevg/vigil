@@ -46,8 +46,9 @@ def create_app(config: VigilConfig, orchestrator, provider=None) -> FastAPI:
     from vigil.api.websocket import start_queue_consumer, websocket_endpoint
     app.add_api_websocket_route("/api/ws/live", websocket_endpoint)
 
-    static_dir = Path(__file__).parent.parent.parent / "web" / "dist"
-    if static_dir.exists():
+    # Bundled dashboard lives under vigil/ui/ (see `make build-ui`); works from site-packages too.
+    static_dir = Path(__file__).parent.parent / "ui"
+    if (static_dir / "index.html").exists():
         assets_dir = static_dir / "assets"
         if assets_dir.exists():
             app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
@@ -65,7 +66,13 @@ def create_app(config: VigilConfig, orchestrator, provider=None) -> FastAPI:
                 return {"detail": "Not Found"}
             return FileResponse(str(static_dir / "index.html"))
     else:
-        log.info("No frontend build found at %s — API-only mode", static_dir)
+        log.warning(
+            "No frontend build found at %s (missing index.html). "
+            "Dashboard will not be available. "
+            "Run 'make build-ui' (or 'cd web && npm install && npm run build' then copy dist/* to vigil/ui/) "
+            "to enable the web UI.",
+            static_dir,
+        )
 
     @app.on_event("startup")
     async def on_startup():

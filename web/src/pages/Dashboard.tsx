@@ -91,13 +91,9 @@ export function Dashboard() {
     api
       .getVigilProjects()
       .then((data) => {
-        const list = data.projects || [];
-        if (list.length === 0) {
-          return fetch("/api/projects?scan_filesystem=true")
-            .then((r) => r.json())
-            .then((d: { projects?: VigilProjectListItem[] }) => d.projects || []);
-        }
-        return list;
+        // Do not scan the filesystem here: auto-importing ~/Developer/**/vigil.yaml
+        // surprised users (e.g. Vigil's own repo) and added projects without consent.
+        return data.projects || [];
       })
       .then((list) => setProjects(list))
       .catch(() => {})
@@ -239,7 +235,14 @@ export function Dashboard() {
                     </div>
                   ) : projects.length === 0 ? (
                     <div className="px-2 py-4 text-center text-sm text-slate-600 dark:text-slate-400">
-                      No projects found. Use Setup to add one.
+                      <p>No projects registered yet.</p>
+                      <Link
+                        to="/setup"
+                        className="mt-2 inline-block font-medium text-blue-600 hover:underline dark:text-blue-400"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        Open Setup to add a project
+                      </Link>
                     </div>
                   ) : (
                     <div className="max-h-64 overflow-y-auto space-y-1">

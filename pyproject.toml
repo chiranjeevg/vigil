@@ -56,6 +56,9 @@ issues = "https://github.com/chiranjeevg/vigil/issues"
 [tool.setuptools.packages.find]
 include = ["vigil*"]
 
+[tool.setuptools.package-data]
+"vigil.ui" = ["index.html", "favicon.svg", "assets/*"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120

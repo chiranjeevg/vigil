@@ -48,10 +48,12 @@ vigil/          Python package (backend)
 ├── prompts/    System/task prompts
 └── db/         SQLAlchemy models + session
 
-web/            React + TypeScript frontend
+web/            React + TypeScript frontend (sources)
 ├── src/pages/  Dashboard, Logs, Settings, Tasks, Setup
 ├── src/lib/    API client
 └── src/hooks/  usePolling, useWebSocket
+
+vigil/ui/       Bundled dashboard static files (`make build-ui` copies `web/dist/` here)
 ```
 
 ## How to Contribute
@@ -79,7 +81,7 @@ Open an [issue](https://github.com/chiranjeevg/vigil/issues/new?labels=enhanceme
 3. Run checks (same as [CI](.github/workflows/ci.yml)):
    - `ruff check vigil/`
    - `pytest -q` (from repo root, with dev deps installed)
-   - `cd web && npm ci && npm run build`
+   - `make build-ui` (or `cd web && npm ci && npm run build` — use `make build-ui` to also populate `vigil/ui/` for local `vigil start`)
 4. Test manually when relevant: `vigil start` and verify behavior
 5. Commit with a clear message
 6. Open a pull request

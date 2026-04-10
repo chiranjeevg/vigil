@@ -126,36 +126,35 @@ Changes are applied via exact **SEARCH/REPLACE** blocks — no blind overwrites.
 
 ## 📦 Quick Start
 
-**Prerequisites:** Python 3.11+ and [Ollama](https://ollama.com) running (or any OpenAI-compatible endpoint).
+**Prerequisites:** Python 3.11+, [Node.js](https://nodejs.org/) (for the dashboard build via `make install`), and [Ollama](https://ollama.com) running (or any OpenAI-compatible endpoint).
 
 ```bash
 # 1. Pull a model
 ollama pull qwen2.5-coder:14b
 
-# 2. Clone and install
+# 2. Clone and install (builds the dashboard into the Python package)
 git clone https://github.com/chiranjeevg/vigil.git
 cd vigil
 python -m venv .venv && source .venv/bin/activate
-pip install -e .
+make install
 
-# 3. (Optional) Build the dashboard
-cd web && npm install && npm run build && cd ..
-
-# 4. Configure
+# 3. Configure
 cp vigil.example.yaml vigil.yaml
 # Edit vigil.yaml — set project.path and tests.command
 
-# 5. Run
+# 4. Run
 vigil start
 ```
 
 Dashboard opens at **http://localhost:7420**. That's it.
 
+If you only run `pip install -e .` (without `make install`), the API starts but the web UI is unavailable until you run `make build-ui` and reinstall, or copy `web/dist/*` into `vigil/ui/` after building the frontend.
+
 <details>
 <summary><strong>One-liner for the bold</strong></summary>
 
 ```bash
-git clone https://github.com/chiranjeevg/vigil.git && cd vigil && python -m venv .venv && source .venv/bin/activate && pip install -e . && cp vigil.example.yaml vigil.yaml && vigil start
+git clone https://github.com/chiranjeevg/vigil.git && cd vigil && python -m venv .venv && source .venv/bin/activate && make install && cp vigil.example.yaml vigil.yaml && vigil start
 ```
 
 </details>
@@ -257,7 +256,7 @@ vigil/
 │   ├── deep_suggest.py  # Multi-phase LLM deep analysis pipeline
 │   └── pr_manager.py    # GitHub PR creation via gh CLI
 ├── api/
-│   ├── server.py        # FastAPI app + static file serving
+│   ├── server.py        # FastAPI app + bundled UI from vigil/ui/
 │   ├── routes_v2.py     # REST API (DB-backed)
 │   └── websocket.py     # Real-time step streaming
 ├── providers/
