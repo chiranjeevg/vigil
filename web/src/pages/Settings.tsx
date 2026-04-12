@@ -1,7 +1,9 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Link, useLocation } from "react-router-dom";
 import {
   Save,
   RotateCcw,
+  RefreshCw,
   FolderOpen,
   Cpu,
   TestTube,
@@ -15,47 +17,25 @@ import {
   Sun,
   Moon,
   Monitor,
+  Target,
+  Globe,
+  Trash2,
+  Plus,
+  Network,
+  CheckCircle2,
+  AlertCircle,
 } from "lucide-react";
 import clsx from "clsx";
 import { useTheme, type ThemePreference } from "@/context/ThemeContext";
 import { usePolling } from "@/hooks/usePolling";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 import {
   pathsEqual,
   type VigilProjectListItem,
 } from "@/lib/pathUtils";
-import type { PRConfig, VigilConfig } from "@/types";
-
-const DEFAULT_PR: PRConfig = {
-  enabled: false,
-  strategy: "per_iteration",
-  base_branch: "main",
-  auto_push: false,
-  labels: [],
-  reviewers: [],
-  use_llm_description: false,
-};
-
-function withNormalizedPr(config: VigilConfig): VigilConfig {
-  const c = structuredClone(config);
-  c.pr = { ...DEFAULT_PR, ...c.pr };
-  const d = c.controls;
-  c.controls = {
-    ...d,
-    max_iterations_total:
-      d.max_iterations_total === undefined ? null : d.max_iterations_total,
-    sleep_after_failure: d.sleep_after_failure ?? 60,
-    min_improvement_threshold: d.min_improvement_threshold ?? 0.1,
-    commit_prefix: d.commit_prefix ?? "vigil",
-    require_test_pass: d.require_test_pass ?? true,
-    stop_on_llm_error: d.stop_on_llm_error ?? true,
-    max_files_per_iteration:
-      d.max_files_per_iteration === undefined ? 5 : d.max_files_per_iteration,
-    max_lines_changed:
-      d.max_lines_changed === undefined ? 200 : d.max_lines_changed,
-  };
-  return c;
-}
+import { mergeVigilConfigFromApi } from "@/lib/vigilConfigMerge";
+import { NewProjectLink } from "@/components/NewProjectLink";
+import type { GoalItem, VigilConfig } from "@/types";
 
 interface LLMModel {
   name: string;
@@ -70,16 +50,22 @@ function Section({
   icon: Icon,
   children,
   defaultOpen = true,
+  id,
 }: {
   title: string;
   icon: typeof FolderOpen;
   children: React.ReactNode;
   defaultOpen?: boolean;
+  /** Anchor for deep links (e.g. Setup → Provider). */
+  id?: string;
 }) {
   const [open, setOpen] = useState(defaultOpen);
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white/90 dark:border-slate-700/50 dark:bg-slate-800/50">
+    <div
+      id={id}
+      className="scroll-mt-24 rounded-xl border border-slate-200 bg-white/90 dark:border-slate-700/50 dark:bg-slate-800/50"
+    >
       <button
         onClick={() => setOpen(!open)}
         className="flex w-full items-center gap-3 px-6 py-4 text-left transition-colors hover:bg-slate-100 dark:hover:bg-slate-800/70"
@@ -137,50 +123,149 @@ const themeOptions: {
 ];
 
 export function Settings() {
+  const location = useLocation();
+  const continueSetupPath =
+    (location.state as { returnTo?: string } | null)?.returnTo ?? null;
+
   const { preference: themePreference, setPreference: setThemePreference } =
     useTheme();
   const { data: daemonStatus, refetch: refetchStatus } = usePolling(
     () => api.getStatus(),
     5000,
   );
+  const { data: prRuntime } = usePolling(() => api.getPrStatus(), 8000);
   const [projects, setProjects] = useState<VigilProjectListItem[]>([]);
   /** Empty string = active daemon's config (GET /config). Non-empty = that path's vigil.yaml. */
   const [settingsProjectPath, setSettingsProjectPath] = useState("");
   const [draft, setDraft] = useState<VigilConfig | null>(null);
   const [configLoading, setConfigLoading] = useState(true);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [loadRetryToken, setLoadRetryToken] = useState(0);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [availableModels, setAvailableModels] = useState<LLMModel[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
+  const [providerTestLoading, setProviderTestLoading] = useState(false);
+  const [providerTestResult, setProviderTestResult] = useState<{
+    latency_ms: number;
+    preview: string;
+    provider_name: string;
+    tokens_used: number;
+  } | null>(null);
+  const [providerTestError, setProviderTestError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadProjects = useCallback(() => {
     api.getVigilProjects().then((r) => setProjects(r.projects || []));
   }, []);
 
   useEffect(() => {
+    loadProjects();
+  }, [loadProjects]);
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible") loadProjects();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [loadProjects]);
+
+  useEffect(() => {
+    setProviderTestResult(null);
+    setProviderTestError(null);
+  }, [settingsProjectPath]);
+
+  useEffect(() => {
+    let cancelled = false;
     setConfigLoading(true);
+    setConfigError(null);
     const fetcher = settingsProjectPath
       ? api.getConfigByProject(settingsProjectPath)
       : api.getConfig();
 
     fetcher
       .then((cfg) => {
-        setDraft(withNormalizedPr(cfg as VigilConfig));
+        if (cancelled) return;
+        try {
+          setDraft(mergeVigilConfigFromApi(cfg));
+        } catch (e) {
+          setDraft(null);
+          setConfigError(
+            e instanceof Error ? e.message : "Could not parse configuration",
+          );
+        }
       })
-      .catch(() => {
+      .catch((e: unknown) => {
+        if (cancelled) return;
         setDraft(null);
+        const msg =
+          e instanceof Error
+            ? e.message
+            : typeof e === "object" && e !== null && "message" in e
+              ? String((e as { message: unknown }).message)
+              : "Failed to load configuration";
+        setConfigError(msg);
       })
-      .finally(() => setConfigLoading(false));
-  }, [settingsProjectPath]);
+      .finally(() => {
+        if (!cancelled) setConfigLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [settingsProjectPath, loadRetryToken]);
 
   useEffect(() => {
+    if (configLoading || configError || !draft) return;
+    if (window.location.hash !== "#settings-provider") return;
+    const timer = window.setTimeout(() => {
+      document
+        .getElementById("settings-provider")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [configLoading, configError, draft]);
+
+  const modelsFetchFirstRef = useRef(true);
+
+  useEffect(() => {
+    modelsFetchFirstRef.current = true;
+  }, [settingsProjectPath]);
+
+  const fetchModelsForProvider = useCallback((d: VigilConfig) => {
     setLoadingModels(true);
-    api.getModels()
-      .then((data) => setAvailableModels(data.models))
-      .catch(() => {})
+    const ptype = d.provider.type;
+    let opts: { openaiBaseUrl?: string; ollamaBaseUrl?: string } | undefined;
+    if (ptype === "openai" && d.provider.base_url?.trim()) {
+      opts = { openaiBaseUrl: d.provider.base_url.trim() };
+    } else if (ptype === "ollama" && d.provider.base_url?.trim()) {
+      opts = { ollamaBaseUrl: d.provider.base_url.trim() };
+    }
+    return api
+      .getModels(opts)
+      .then((data) =>
+        setAvailableModels(Array.isArray(data.models) ? data.models : []),
+      )
+      .catch(() => setAvailableModels([]))
       .finally(() => setLoadingModels(false));
   }, []);
+
+  useEffect(() => {
+    if (!draft) return;
+    const d = draft;
+    const delay = modelsFetchFirstRef.current ? 0 : 400;
+    modelsFetchFirstRef.current = false;
+    const timer = window.setTimeout(() => {
+      void fetchModelsForProvider(d);
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [
+    draft?.provider.type,
+    draft?.provider.base_url,
+    settingsProjectPath,
+    fetchModelsForProvider,
+  ]);
 
   function update<K extends keyof VigilConfig>(
     section: K,
@@ -193,6 +278,17 @@ export function Settings() {
         ...prev,
         [section]: { ...prev[section], [key]: value },
       };
+    });
+  }
+
+  /** Patch a single field of a goal entry at the given list index. */
+  function updateGoal(idx: number, patch: Partial<GoalItem>) {
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const updated: GoalItem[] = prev.goals.current.map((g, i) =>
+        i === idx ? ({ ...g, ...patch } as GoalItem) : g,
+      );
+      return { ...prev, goals: { ...prev.goals, current: updated } };
     });
   }
 
@@ -236,8 +332,42 @@ export function Settings() {
       ? api.getConfigByProject(settingsProjectPath)
       : api.getConfig();
     void fetcher
-      .then((cfg) => setDraft(withNormalizedPr(cfg as VigilConfig)))
+      .then((cfg) => {
+        try {
+          setDraft(mergeVigilConfigFromApi(cfg));
+        } catch {
+          /* ignore */
+        }
+      })
       .catch(() => {});
+  }
+
+  async function handleTestProvider() {
+    if (!draft) return;
+    setProviderTestLoading(true);
+    setProviderTestError(null);
+    setProviderTestResult(null);
+    try {
+      const r = await api.testProviderConnection(
+        draft.provider as unknown as Record<string, unknown>,
+      );
+      setProviderTestResult({
+        latency_ms: r.latency_ms,
+        preview: r.preview,
+        provider_name: r.provider_name,
+        tokens_used: r.tokens_used,
+      });
+    } catch (e: unknown) {
+      const msg =
+        e instanceof ApiError
+          ? e.message
+          : e instanceof Error
+            ? e.message
+            : "Connectivity test failed";
+      setProviderTestError(msg);
+    } finally {
+      setProviderTestLoading(false);
+    }
   }
 
   const editingLabel = settingsProjectPath
@@ -250,7 +380,7 @@ export function Settings() {
     !settingsProjectPath ||
     pathsEqual(settingsProjectPath, daemonStatus?.project_path);
 
-  if (configLoading || !draft) {
+  if (configLoading) {
     return (
       <div className="flex h-64 items-center justify-center">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
@@ -258,8 +388,45 @@ export function Settings() {
     );
   }
 
+  if (configError || !draft) {
+    return (
+      <div className="rounded-xl border border-red-300/60 bg-red-50/90 p-6 dark:border-red-900/50 dark:bg-red-950/30">
+        <h2 className="text-lg font-semibold text-red-900 dark:text-red-200">
+          Could not load settings
+        </h2>
+        <p className="mt-2 text-sm text-red-800/95 dark:text-red-300/90">
+          {configError ?? "Configuration is unavailable. Check that Vigil is running and the API is reachable."}
+        </p>
+        <button
+          type="button"
+          onClick={() => {
+            setLoadRetryToken((n) => n + 1);
+          }}
+          className="mt-4 inline-flex items-center gap-2 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-500"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
+      {continueSetupPath && (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-cyan-500/35 bg-cyan-500/5 px-4 py-3 dark:border-cyan-500/25 dark:bg-cyan-950/25">
+          <p className="text-sm text-cyan-950 dark:text-cyan-100/95">
+            After you <strong>Save</strong> provider (or other) changes, return to the new-project wizard to pick a
+            folder and finish setup.
+          </p>
+          <Link
+            to={continueSetupPath}
+            className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-cyan-500 dark:bg-cyan-600 dark:hover:bg-cyan-500"
+          >
+            Continue setup
+          </Link>
+        </div>
+      )}
+
       <div className="rounded-xl border border-slate-200 bg-white/90 p-5 dark:border-slate-700/50 dark:bg-slate-800/50">
         <div className="mb-3 flex items-center gap-2">
           <Monitor className="h-5 w-5 text-blue-600 dark:text-blue-400" />
@@ -294,32 +461,35 @@ export function Settings() {
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Settings</h1>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
-            Per-project <code className="rounded bg-slate-200 px-1.5 py-0.5 font-mono text-xs text-slate-800 dark:bg-slate-800 dark:text-slate-200">vigil.yaml</code>{" "}
-            — choose a project, edit, then save. Use &quot;Switch daemon&quot; so Start/Stop runs on that repo.
+            Per-project <code className="rounded bg-slate-200 px-1.5 py-0.5 font-mono text-xs text-slate-800 dark:bg-slate-800 dark:text-slate-200">vigil.yaml</code>
+            — pick which repo to edit, then save. Use &quot;Switch daemon&quot; so Start/Stop runs on that
+            repo. To register another codebase, use{" "}
+            <span className="font-medium text-slate-800 dark:text-slate-200">New project</span> (setup
+            wizard).
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {projects.length > 0 && (
-            <div className="relative min-w-[220px]">
-              <FolderOpen className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-              <select
-                value={settingsProjectPath}
-                onChange={(e) => setSettingsProjectPath(e.target.value)}
-                className="w-full appearance-none rounded-lg border border-slate-300 bg-white py-2 pl-9 pr-8 text-xs font-medium text-slate-800 outline-none transition-colors hover:border-slate-400 focus:border-blue-500 dark:border-slate-700/50 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:border-slate-600"
-              >
-                <option value="">
-                  Active daemon — {daemonStatus?.project_name ?? "loading…"}
+          <NewProjectLink fromSettings />
+          <div className="relative min-w-[220px]">
+            <FolderOpen className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+            <select
+              value={settingsProjectPath}
+              onChange={(e) => setSettingsProjectPath(e.target.value)}
+              className="w-full appearance-none rounded-lg border border-slate-300 bg-white py-2 pl-9 pr-8 text-xs font-medium text-slate-800 outline-none transition-colors hover:border-slate-400 focus:border-blue-500 dark:border-slate-700/50 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:border-slate-600"
+              aria-label="Project to edit"
+            >
+              <option value="">
+                Active daemon — {daemonStatus?.project_name ?? "loading…"}
+              </option>
+              {projects.map((p) => (
+                <option key={p.path} value={p.path}>
+                  {p.name}
+                  {pathsEqual(p.path, daemonStatus?.project_path) ? " (active)" : ""}
                 </option>
-                {projects.map((p) => (
-                  <option key={p.path} value={p.path}>
-                    {p.name}
-                    {pathsEqual(p.path, daemonStatus?.project_path) ? " (active)" : ""}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-            </div>
-          )}
+              ))}
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+          </div>
           {settingsProjectPath && !selectionIsActive && (
             <button
               type="button"
@@ -400,7 +570,7 @@ export function Settings() {
           <Field label="Include Paths">
             <input
               type="text"
-              value={draft.project.include_paths.join(", ")}
+              value={(draft.project.include_paths ?? []).join(", ")}
               onChange={(e) =>
                 update(
                   "project",
@@ -415,7 +585,7 @@ export function Settings() {
           <Field label="Exclude Paths">
             <input
               type="text"
-              value={draft.project.exclude_paths.join(", ")}
+              value={(draft.project.exclude_paths ?? []).join(", ")}
               onChange={(e) =>
                 update(
                   "project",
@@ -430,7 +600,7 @@ export function Settings() {
         </div>
       </Section>
 
-      <Section title="Provider" icon={Cpu}>
+      <Section id="settings-provider" title="Provider" icon={Cpu}>
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <Field label="Type">
             <select
@@ -446,36 +616,75 @@ export function Settings() {
             </select>
           </Field>
           <Field label="Model">
+            {draft.provider.type === "openai" && (
+              <p className="mb-2 text-[11px] text-slate-500 dark:text-slate-400">
+                With a base URL set, Vigil loads models from{" "}
+                <code className="rounded bg-slate-200 px-1 font-mono text-[10px] dark:bg-slate-800">
+                  /v1/models
+                </code>{" "}
+                (e.g. <code className="font-mono text-[10px]">curl -s http://localhost:4000/v1/models</code>
+                ).
+              </p>
+            )}
             {loadingModels ? (
               <div className="flex items-center gap-2 py-2">
                 <Loader2 className="h-4 w-4 animate-spin text-blue-600 dark:text-blue-400" />
-                <span className="text-sm text-slate-600 dark:text-slate-400">Detecting models...</span>
+                <span className="text-sm text-slate-600 dark:text-slate-400">Loading models…</span>
               </div>
-            ) : availableModels.length > 0 ? (
+            ) : (availableModels ?? []).length > 0 ? (
               <div className="space-y-2">
-                <select
-                  value={draft.provider.model}
-                  onChange={(e) => update("provider", "model", e.target.value)}
-                  className={selectClass}
-                >
-                  {!availableModels.some((m) => m.name === draft.provider.model) && (
-                    <option value={draft.provider.model}>{draft.provider.model} (current)</option>
-                  )}
-                  {availableModels.map((m) => (
-                    <option key={m.name} value={m.name}>
-                      {m.name}{m.parameter_size ? ` (${m.parameter_size})` : ""}{m.size_gb ? ` — ${m.size_gb}GB` : ""}
-                    </option>
-                  ))}
-                </select>
+                <div className="flex flex-wrap items-stretch gap-2">
+                  <select
+                    value={draft.provider.model}
+                    onChange={(e) => update("provider", "model", e.target.value)}
+                    className={clsx(selectClass, "min-w-0 flex-1")}
+                  >
+                    {!(availableModels ?? []).some((m) => m.name === draft.provider.model) && (
+                      <option value={draft.provider.model}>{draft.provider.model} (current)</option>
+                    )}
+                    {(availableModels ?? []).map((m) => (
+                      <option key={`${m.provider}-${m.name}`} value={m.name}>
+                        {m.name}
+                        {m.provider === "openai" ? " (OpenAI-compatible)" : ""}
+                        {m.parameter_size ? ` (${m.parameter_size})` : ""}
+                        {m.size_gb ? ` — ${m.size_gb}GB` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    title="Refresh model list from server"
+                    onClick={() => draft && void fetchModelsForProvider(draft)}
+                    disabled={loadingModels}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    Refresh
+                  </button>
+                </div>
               </div>
             ) : (
-              <input
-                type="text"
-                value={draft.provider.model}
-                onChange={(e) => update("provider", "model", e.target.value)}
-                placeholder="e.g. qwen2.5-coder:14b"
-                className={clsx(inputClass, "font-mono")}
-              />
+              <div className="space-y-2">
+                <input
+                  type="text"
+                  value={draft.provider.model}
+                  onChange={(e) => update("provider", "model", e.target.value)}
+                  placeholder="e.g. gpt-4o-mini or qwen2.5-coder:14b"
+                  className={clsx(inputClass, "font-mono")}
+                />
+                {(draft.provider.type === "openai" || draft.provider.type === "ollama") &&
+                  draft.provider.base_url?.trim() && (
+                    <button
+                      type="button"
+                      onClick={() => draft && void fetchModelsForProvider(draft)}
+                      disabled={loadingModels}
+                      className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 hover:underline disabled:opacity-50 dark:text-blue-400"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      Try loading models from server
+                    </button>
+                  )}
+              </div>
             )}
           </Field>
           <Field label="Base URL">
@@ -509,6 +718,54 @@ export function Settings() {
               className="w-full accent-blue-500"
             />
           </Field>
+        </div>
+        <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-700/50">
+          <p className="mb-2 text-xs text-slate-600 dark:text-slate-400">
+            Verify base URL, model, and API key (if required) with a tiny request. Uses the
+            values above — you do not need to save first.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleTestProvider()}
+              disabled={providerTestLoading}
+              className="inline-flex items-center gap-2 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-2 text-xs font-medium text-cyan-900 transition-colors hover:bg-cyan-500/15 disabled:opacity-50 dark:border-cyan-600/45 dark:bg-cyan-950/35 dark:text-cyan-200 dark:hover:bg-cyan-900/45"
+            >
+              {providerTestLoading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Network className="h-3.5 w-3.5" />
+              )}
+              {providerTestLoading ? "Testing…" : "Test connection"}
+            </button>
+            {providerTestResult && (
+              <span className="inline-flex items-center gap-1 text-xs text-green-700 dark:text-green-400">
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                OK · {providerTestResult.latency_ms} ms
+              </span>
+            )}
+          </div>
+          {providerTestResult && (
+            <div className="mt-2 rounded-lg bg-green-500/10 px-3 py-2 text-xs text-green-900 dark:text-green-100/90">
+              <p className="font-mono text-[11px] text-green-800/90 dark:text-green-200/85">
+                {providerTestResult.provider_name}
+              </p>
+              <p className="mt-1 text-slate-700 dark:text-slate-300">
+                {providerTestResult.tokens_used > 0 && (
+                  <span className="mr-2">
+                    {providerTestResult.tokens_used} tokens ·{" "}
+                  </span>
+                )}
+                Preview: {providerTestResult.preview || "(empty)"}
+              </p>
+            </div>
+          )}
+          {providerTestError && (
+            <div className="mt-2 flex gap-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-800 dark:text-red-200/95">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <p className="min-w-0 break-words">{providerTestError}</p>
+            </div>
+          )}
         </div>
       </Section>
 
@@ -870,10 +1127,80 @@ export function Settings() {
         </div>
       </Section>
 
-      <Section title="Pull requests (Git branch / PR)" icon={GitPullRequest} defaultOpen>
+      <Section
+        title="Pull requests (Git branch / PR)"
+        icon={GitPullRequest}
+        defaultOpen
+        id="settings-pr"
+      >
+        <p className="mb-4 text-sm text-slate-600 dark:text-slate-400">
+          <strong>PR workflow off:</strong> Vigil only creates local branches{" "}
+          <code className="rounded bg-slate-200 px-1 font-mono text-xs dark:bg-slate-800">vigil/…</code>{" "}
+          from <strong>Work branch</strong> below — no push, no GitHub PR.
+          <br />
+          <strong>PR workflow on:</strong> After a successful iteration, Vigil can{" "}
+          <code className="rounded bg-slate-200 px-1 font-mono text-xs dark:bg-slate-800">git push</code>{" "}
+          and run <code className="rounded bg-slate-200 px-1 font-mono text-xs dark:bg-slate-800">gh pr create</code>{" "}
+          (requires <code className="font-mono text-xs">gh</code> on the machine where Vigil runs — not Cursor MCP).
+          Set <strong>Auto push</strong> on and save <code className="font-mono text-xs">vigil.yaml</code>, then restart Vigil.
+        </p>
+
+        {prRuntime && (
+          <div
+            className={clsx(
+              "mb-4 rounded-lg border px-4 py-3 sm:px-5",
+              prRuntime.preflight_ok
+                ? "border-emerald-400/40 bg-emerald-50/90 dark:border-emerald-500/25 dark:bg-emerald-950/20"
+                : "border-slate-300/80 bg-slate-100/90 dark:border-slate-600/50 dark:bg-slate-900/40",
+            )}
+          >
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
+              {prRuntime.preflight_ok ? (
+                <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+              ) : (
+                <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+              )}
+              Runtime checks (this host)
+            </div>
+            <ul className="mt-2 list-inside list-disc space-y-1 text-sm text-slate-700 dark:text-slate-300">
+              <li>
+                <code className="font-mono text-xs">pr.enabled</code> in running process:{" "}
+                {prRuntime.pr_active ? "true" : "false"} (saved config:{" "}
+                {prRuntime.enabled ? "yes" : "no"})
+              </li>
+              <li>
+                Git push to <code className="font-mono text-xs">origin</code>:{" "}
+                {prRuntime.push_enabled ? (
+                  <span className="text-emerald-700 dark:text-emerald-400">ready</span>
+                ) : (
+                  <span className="text-amber-800 dark:text-amber-300">blocked</span>
+                )}
+              </li>
+              <li>
+                <code className="font-mono text-xs">gh pr create</code>:{" "}
+                {prRuntime.gh_pr_enabled ? (
+                  <span className="text-emerald-700 dark:text-emerald-400">ready</span>
+                ) : (
+                  <span className="text-amber-800 dark:text-amber-300">blocked</span>
+                )}
+              </li>
+            </ul>
+            <p className="mt-2 text-xs text-slate-600 dark:text-slate-400">
+              {prRuntime.preflight_message}
+            </p>
+            {prRuntime.merge_queue_head ? (
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-500">
+                Merge queue HEAD:{" "}
+                <code className="font-mono">{prRuntime.merge_queue_head.slice(0, 12)}…</code>
+              </p>
+            ) : null}
+          </div>
+        )}
+
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <Field label="Enable PR Workflow">
             <button
+              type="button"
               onClick={() => update("pr", "enabled", !draft.pr.enabled)}
               className={clsx(
                 "rounded-lg px-4 py-2 text-sm font-medium transition-all duration-200",
@@ -884,9 +1211,13 @@ export function Settings() {
             >
               {draft.pr.enabled ? "Enabled" : "Disabled"}
             </button>
+            <p className="mt-1 text-xs text-slate-500">
+              Maps to <code className="font-mono">pr.enabled</code> in vigil.yaml
+            </p>
           </Field>
           <Field label="Use LLM for PR Description">
             <button
+              type="button"
               onClick={() =>
                 update("pr", "use_llm_description", !draft.pr.use_llm_description)
               }
@@ -899,83 +1230,473 @@ export function Settings() {
             >
               {draft.pr.use_llm_description ? "LLM Generated" : "Static Template"}
             </button>
-          </Field>
-          {draft.pr.enabled && (
-            <>
-              <Field label="Base Branch">
-                <input
-                  type="text"
-                  value={draft.pr.base_branch}
-                  onChange={(e) => update("pr", "base_branch", e.target.value)}
-                  placeholder="main"
-                  className={clsx(inputClass, "font-mono")}
-                />
-              </Field>
-              <Field label="Strategy">
-                <select
-                  value={draft.pr.strategy}
-                  onChange={(e) => update("pr", "strategy", e.target.value)}
-                  className={selectClass}
-                >
-                  <option value="per_iteration">Per Iteration</option>
-                </select>
-              </Field>
-              <Field label="Labels (comma-separated)">
-                <input
-                  type="text"
-                  value={draft.pr.labels.join(", ")}
-                  onChange={(e) =>
-                    update(
-                      "pr",
-                      "labels",
-                      e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
-                    )
-                  }
-                  placeholder="vigil, automated"
-                  className={clsx(inputClass, "font-mono")}
-                />
-              </Field>
-              <Field label="Reviewers (comma-separated)">
-                <input
-                  type="text"
-                  value={draft.pr.reviewers.join(", ")}
-                  onChange={(e) =>
-                    update(
-                      "pr",
-                      "reviewers",
-                      e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
-                    )
-                  }
-                  placeholder="username1, username2"
-                  className={clsx(inputClass, "font-mono")}
-                />
-              </Field>
-              <Field label="Auto Push">
-                <button
-                  onClick={() =>
-                    update("pr", "auto_push", !draft.pr.auto_push)
-                  }
-                  className={clsx(
-                    "rounded-lg px-4 py-2 text-sm font-medium transition-all duration-200",
-                    draft.pr.auto_push
-                      ? "bg-green-600/15 text-green-800 dark:bg-green-600/20 dark:text-green-400"
-                      : "bg-slate-200 text-slate-600 dark:bg-slate-700/50 dark:text-slate-400",
-                  )}
-                >
-                  {draft.pr.auto_push ? "On" : "Off"}
-                </button>
-              </Field>
-            </>
-          )}
-        </div>
-        {draft.pr.enabled && (
-          <div className="mt-4 rounded-lg border border-amber-400/35 bg-amber-50 px-4 py-3 dark:border-amber-500/20 dark:bg-amber-500/5">
-            <p className="text-sm text-amber-900 dark:text-amber-400">
-              Requires GitHub CLI (<code className="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-xs dark:bg-slate-800">gh</code>) to be installed and authenticated.
-              The project must have a git remote configured.
+            <p className="mt-1 text-xs text-slate-500">
+              <code className="font-mono">pr.use_llm_description</code>
             </p>
+          </Field>
+
+          <Field label="Work branch (local iterations)">
+            <input
+              type="text"
+              value={draft.controls.work_branch}
+              onChange={(e) =>
+                update("controls", "work_branch", e.target.value)
+              }
+              className={clsx(inputClass, "font-mono")}
+              placeholder="vigil-improvements"
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              <code className="font-mono">controls.work_branch</code> — branch Vigil returns to between iterations; iteration branches fork from here when PR is off (or as the chain base).
+            </p>
+          </Field>
+
+          <Field label="Base branch (GitHub PR target)">
+            <input
+              type="text"
+              value={draft.pr.base_branch}
+              onChange={(e) => update("pr", "base_branch", e.target.value)}
+              placeholder="main"
+              className={clsx(inputClass, "font-mono")}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              <code className="font-mono">pr.base_branch</code> — target for opened PRs
+            </p>
+          </Field>
+
+          <Field label="Strategy">
+            <select
+              value={draft.pr.strategy}
+              onChange={(e) => update("pr", "strategy", e.target.value)}
+              className={selectClass}
+            >
+              <option value="per_iteration">Per Iteration</option>
+            </select>
+            <p className="mt-1 text-xs text-slate-500">
+              <code className="font-mono">pr.strategy</code>
+            </p>
+          </Field>
+
+          <Field label="Auto Push">
+            <button
+              type="button"
+              onClick={() => update("pr", "auto_push", !draft.pr.auto_push)}
+              className={clsx(
+                "rounded-lg px-4 py-2 text-sm font-medium transition-all duration-200",
+                draft.pr.auto_push
+                  ? "bg-green-600/15 text-green-800 dark:bg-green-600/20 dark:text-green-400"
+                  : "bg-slate-200 text-slate-600 dark:bg-slate-700/50 dark:text-slate-400",
+              )}
+            >
+              {draft.pr.auto_push ? "On" : "Off"}
+            </button>
+            <p className="mt-1 text-xs text-slate-500">
+              <code className="font-mono">pr.auto_push</code> — must be on for push + gh PR after each iteration
+            </p>
+          </Field>
+
+          <Field label="Labels (comma-separated)">
+            <input
+              type="text"
+              value={(draft.pr.labels ?? []).join(", ")}
+              onChange={(e) =>
+                update(
+                  "pr",
+                  "labels",
+                  e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                )
+              }
+              placeholder="vigil, automated"
+              className={clsx(inputClass, "font-mono")}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              <code className="font-mono">pr.labels</code>
+            </p>
+          </Field>
+
+          <Field label="Reviewers (comma-separated)">
+            <input
+              type="text"
+              value={(draft.pr.reviewers ?? []).join(", ")}
+              onChange={(e) =>
+                update(
+                  "pr",
+                  "reviewers",
+                  e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                )
+              }
+              placeholder="username1, username2"
+              className={clsx(inputClass, "font-mono")}
+            />
+            <p className="mt-1 text-xs text-slate-500">
+              <code className="font-mono">pr.reviewers</code> — GitHub usernames
+            </p>
+          </Field>
+        </div>
+
+        <div className="mt-4 rounded-lg border border-amber-400/35 bg-amber-50 px-4 py-3 dark:border-amber-500/20 dark:bg-amber-500/5">
+          <p className="text-sm font-medium text-amber-950 dark:text-amber-200">
+            Checklist for automated PRs
+          </p>
+          <ul className="mt-2 list-inside list-disc space-y-1 text-sm text-amber-900 dark:text-amber-400/95">
+            <li>
+              <code className="font-mono">pr.enabled</code> and <code className="font-mono">pr.auto_push</code> set to on, then Save
+            </li>
+            <li>
+              <code className="font-mono">git remote</code> points to GitHub (<code className="font-mono">origin</code>)
+            </li>
+            <li>
+              GitHub CLI: <code className="font-mono">gh --version</code> and <code className="font-mono">gh auth login</code> on the same machine as Vigil
+            </li>
+            <li>Restart Vigil after saving so the orchestrator picks up the new config</li>
+          </ul>
+        </div>
+      </Section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Engineer mode                                                        */}
+      {/* ------------------------------------------------------------------ */}
+      <Section title="Engineer mode" icon={Target} defaultOpen>
+        <p className="mb-4 text-sm text-slate-600 dark:text-slate-400">
+          Switch Vigil from a code-improvement loop to a 24/7 software engineer.
+          In <strong>Engineer</strong> mode Vigil works through your goals and work sources first,
+          only falling back to improvement tasks when nothing actionable remains.
+        </p>
+        <Field label="Priority mode">
+          <div className="flex gap-3">
+            {(["improver", "engineer"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => update("tasks", "priority_mode", mode)}
+                className={clsx(
+                  "rounded-lg px-5 py-2 text-sm font-medium capitalize transition-all duration-200",
+                  draft.tasks.priority_mode === mode
+                    ? "bg-blue-600 text-white shadow"
+                    : "bg-slate-200 text-slate-600 dark:bg-slate-700/50 dark:text-slate-400",
+                )}
+              >
+                {mode}
+              </button>
+            ))}
           </div>
-        )}
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-500">
+            <strong>Improver</strong> — original behaviour: walks the static priority list.{" "}
+            <strong>Engineer</strong> — goals and work sources first; improvements only as fallback.
+          </p>
+        </Field>
+      </Section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Goals                                                                */}
+      {/* ------------------------------------------------------------------ */}
+      <Section title="Goals" icon={Target} defaultOpen={draft.tasks.priority_mode === "engineer"}>
+        <p className="mb-4 text-sm text-slate-600 dark:text-slate-400">
+          Define what Vigil should build or fix next. Goals take highest priority in Engineer mode.
+          Each goal can reference source files to edit and design documents to read as requirements.
+        </p>
+
+        <div className="space-y-3">
+          {draft.goals.current.map((goal, idx) => (
+            <div
+              key={goal.id}
+              className="rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-900/40"
+            >
+              <div className="flex items-start gap-3">
+                <div className="flex-1 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <span className="rounded bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800 dark:bg-blue-900/40 dark:text-blue-300">
+                      P{goal.priority}
+                    </span>
+                    {goal.issue_ref && (
+                      <span className="rounded bg-slate-200 px-2 py-0.5 font-mono text-xs text-slate-600 dark:bg-slate-700 dark:text-slate-400">
+                        {goal.issue_ref}
+                      </span>
+                    )}
+                  </div>
+                  <input
+                    type="text"
+                    value={goal.description}
+                    onChange={(e) =>
+                      updateGoal(idx, { description: e.target.value })
+                    }
+                    placeholder="Describe what to build or fix…"
+                    className={clsx(inputClass, "font-medium")}
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">Priority (1–5)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={5}
+                        value={goal.priority}
+                        onChange={(e) =>
+                          updateGoal(idx, { priority: Number(e.target.value) })
+                        }
+                        className={inputClass}
+                      />
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-xs text-slate-500">Issue ref (optional)</label>
+                      <input
+                        type="text"
+                        value={goal.issue_ref ?? ""}
+                        onChange={(e) =>
+                          updateGoal(idx, { issue_ref: e.target.value || null })
+                        }
+                        placeholder="org/repo#42"
+                        className={clsx(inputClass, "font-mono")}
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs text-slate-500">
+                      Context files (comma-separated relative paths)
+                    </label>
+                    <input
+                      type="text"
+                      value={goal.context_files.join(", ")}
+                      onChange={(e) =>
+                        updateGoal(idx, {
+                          context_files: e.target.value
+                            .split(",")
+                            .map((s) => s.trim())
+                            .filter(Boolean),
+                        })
+                      }
+                      placeholder="src/matching/engine.ts, src/types.ts"
+                      className={clsx(inputClass, "font-mono text-xs")}
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs text-slate-500">
+                      Design docs / PRDs (comma-separated paths — read-only for LLM)
+                    </label>
+                    <input
+                      type="text"
+                      value={goal.context_docs.join(", ")}
+                      onChange={(e) =>
+                        updateGoal(idx, {
+                          context_docs: e.target.value
+                            .split(",")
+                            .map((s) => s.trim())
+                            .filter(Boolean),
+                        })
+                      }
+                      placeholder="docs/PRDs/price-feed.md"
+                      className={clsx(inputClass, "font-mono text-xs")}
+                    />
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    const updated = draft.goals.current.filter((_, i) => i !== idx);
+                    update("goals", "current", updated);
+                  }}
+                  className="mt-1 rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-900/30 dark:hover:text-red-400"
+                  title="Remove goal"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          ))}
+
+          <button
+            onClick={() => {
+              const newGoal = {
+                id: `goal-${Date.now()}`,
+                description: "",
+                priority: 1,
+                context_files: [],
+                context_docs: [],
+                issue_ref: null,
+              };
+              update("goals", "current", [...draft.goals.current, newGoal]);
+            }}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 py-3 text-sm text-slate-500 transition-colors hover:border-blue-400 hover:text-blue-600 dark:border-slate-600 dark:hover:border-blue-500 dark:hover:text-blue-400"
+          >
+            <Plus className="h-4 w-4" />
+            Add goal
+          </button>
+        </div>
+      </Section>
+
+      {/* ------------------------------------------------------------------ */}
+      {/* Work sources                                                          */}
+      {/* ------------------------------------------------------------------ */}
+      <Section title="Work sources" icon={Globe} defaultOpen={false}>
+        <p className="mb-4 text-sm text-slate-600 dark:text-slate-400">
+          Automatically feed tasks from external sources. Active in Engineer mode.
+          GitHub issues require <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs dark:bg-slate-800">gh</code> to be authenticated.
+        </p>
+
+        <div className="space-y-6">
+          {/* GitHub Issues */}
+          <div>
+            <div className="mb-3 flex items-center gap-3">
+              <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                GitHub Issues
+              </span>
+              <button
+                onClick={() =>
+                  update("work_sources", "github_issues", {
+                    ...draft.work_sources.github_issues,
+                    enabled: !draft.work_sources.github_issues.enabled,
+                  })
+                }
+                className={clsx(
+                  "rounded-lg px-3 py-1 text-xs font-medium transition-all duration-200",
+                  draft.work_sources.github_issues.enabled
+                    ? "bg-green-600/15 text-green-800 dark:bg-green-600/20 dark:text-green-400"
+                    : "bg-slate-200 text-slate-600 dark:bg-slate-700/50 dark:text-slate-400",
+                )}
+              >
+                {draft.work_sources.github_issues.enabled ? "Enabled" : "Disabled"}
+              </button>
+            </div>
+
+            {draft.work_sources.github_issues.enabled && (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <div className="col-span-full">
+                  <label className="mb-1 block text-xs text-slate-500">
+                    Repositories (comma-separated, e.g. org/repo)
+                  </label>
+                  <input
+                    type="text"
+                    value={draft.work_sources.github_issues.repos.join(", ")}
+                    onChange={(e) =>
+                      update("work_sources", "github_issues", {
+                        ...draft.work_sources.github_issues,
+                        repos: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                      })
+                    }
+                    placeholder="myorg/exchange-core, myorg/matching-engine"
+                    className={clsx(inputClass, "font-mono text-xs")}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">
+                    Labels to include (comma-separated)
+                  </label>
+                  <input
+                    type="text"
+                    value={draft.work_sources.github_issues.labels_include.join(", ")}
+                    onChange={(e) =>
+                      update("work_sources", "github_issues", {
+                        ...draft.work_sources.github_issues,
+                        labels_include: e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      })
+                    }
+                    placeholder="bug, feature, p0, p1"
+                    className={clsx(inputClass, "font-mono text-xs")}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">
+                    Labels to exclude (comma-separated)
+                  </label>
+                  <input
+                    type="text"
+                    value={draft.work_sources.github_issues.labels_exclude.join(", ")}
+                    onChange={(e) =>
+                      update("work_sources", "github_issues", {
+                        ...draft.work_sources.github_issues,
+                        labels_exclude: e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      })
+                    }
+                    placeholder="wontfix, duplicate"
+                    className={clsx(inputClass, "font-mono text-xs")}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">Max tasks per poll</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={draft.work_sources.github_issues.max_tasks}
+                    onChange={(e) =>
+                      update("work_sources", "github_issues", {
+                        ...draft.work_sources.github_issues,
+                        max_tasks: Number(e.target.value),
+                      })
+                    }
+                    className={inputClass}
+                  />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs text-slate-500">
+                    Poll interval (seconds)
+                  </label>
+                  <input
+                    type="number"
+                    min={60}
+                    value={draft.work_sources.github_issues.poll_interval}
+                    onChange={(e) =>
+                      update("work_sources", "github_issues", {
+                        ...draft.work_sources.github_issues,
+                        poll_interval: Number(e.target.value),
+                      })
+                    }
+                    className={inputClass}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* PRD paths */}
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">
+              PRD / Design doc paths
+            </label>
+            <p className="mb-2 text-xs text-slate-500">
+              Vigil scans these markdown files for unchecked tasks and TODOs.
+              Paths relative to the project root.
+            </p>
+            <input
+              type="text"
+              value={draft.work_sources.prd_paths.join(", ")}
+              onChange={(e) =>
+                update("work_sources", "prd_paths", e.target.value
+                  .split(",")
+                  .map((s) => s.trim())
+                  .filter(Boolean))
+              }
+              placeholder="docs/PRDs/matching-engine.md, docs/design/settlement.md"
+              className={clsx(inputClass, "font-mono text-xs")}
+            />
+          </div>
+
+          {/* Always-on context documents */}
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">
+              Always-on context documents
+            </label>
+            <p className="mb-2 text-xs text-slate-500">
+              These documents are injected into every iteration prompt as read-only context
+              (architecture overview, API spec, coding guidelines, etc.).
+            </p>
+            <input
+              type="text"
+              value={draft.work_sources.context_documents.join(", ")}
+              onChange={(e) =>
+                update("work_sources", "context_documents", e.target.value
+                  .split(",")
+                  .map((s) => s.trim())
+                  .filter(Boolean))
+              }
+              placeholder="docs/architecture.md, docs/api-spec.yaml"
+              className={clsx(inputClass, "font-mono text-xs")}
+            />
+          </div>
+        </div>
       </Section>
     </div>
   );

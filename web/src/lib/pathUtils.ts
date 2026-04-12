@@ -3,14 +3,13 @@ export function pathsEqual(
   a: string | undefined | null,
   b: string | undefined | null,
 ): boolean {
-  if (!a || !b) return false;
+  if (a == null || b == null) return false;
+  const sa = String(a).trim();
+  const sb = String(b).trim();
+  if (!sa || !sb) return false;
   const norm = (s: string) =>
-    s
-      .trim()
-      .replace(/\\/g, "/")
-      .replace(/\/+$/, "")
-      .toLowerCase();
-  return norm(a) === norm(b);
+    s.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return norm(sa) === norm(sb);
 }
 
 /** Row shape used by Dashboard / Logs / Settings project pickers */

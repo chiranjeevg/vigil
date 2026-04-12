@@ -18,6 +18,19 @@ def get_task_prompt(task: dict, context: dict, config: VigilConfig) -> str:
     if task_instructions and task_instructions != task.get("instructions"):
         sections.append(f"## Additional Instructions\n{task_instructions}")
 
+    # Reference documents (PRDs, design specs, ADRs) — read-only requirements.
+    # Rendered before source files so the LLM reads requirements first.
+    reference_docs = context.get("reference_docs", {})
+    if reference_docs:
+        parts = [
+            "## Reference Documents\n"
+            "> These are **read-only** design documents / PRDs. "
+            "Use them as requirements. Do NOT modify them."
+        ]
+        for doc_path, content in reference_docs.items():
+            parts.append(f"### {doc_path}\n```\n{content}\n```")
+        sections.append("\n".join(parts))
+
     file_tree = context.get("file_tree", "")
     if file_tree:
         sections.append(f"## Project File Tree\n```\n{file_tree}\n```")

@@ -24,6 +24,7 @@ def cmd_start(args):
     global _orchestrator
 
     import logging as _logging
+    import os
 
     _logging.basicConfig(
         level=_logging.INFO,
@@ -36,7 +37,35 @@ def cmd_start(args):
     from vigil.providers import create_provider
 
     config = load_config(args.config)
+    if not (config.project.path or "").strip():
+        if os.getenv("VIGIL_USE_DATABASE", "false").lower() == "true":
+            import asyncio
+
+            from vigil.daemon_bootstrap import resolve_daemon_config_if_empty_project_path
+
+            try:
+                config = asyncio.run(resolve_daemon_config_if_empty_project_path(config))
+            except ValueError as e:
+                _logging.getLogger(__name__).error("%s", e)
+                sys.exit(1)
+        else:
+            _logging.getLogger(__name__).error(
+                "vigil.yaml has no project.path. Set it to your repository root, or set "
+                "VIGIL_USE_DATABASE=true and register a project in the dashboard."
+            )
+            sys.exit(1)
+
     provider = create_provider(config.provider)
+
+    if os.getenv("VIGIL_USE_DATABASE", "false").lower() != "true":
+        from vigil.dev_self import allow_vigil_self_project, is_vigil_source_repo_path
+
+        if is_vigil_source_repo_path(config.project.path) and not allow_vigil_self_project():
+            _logging.getLogger(__name__).warning(
+                "Config targets the Vigil source checkout. With VIGIL_USE_DATABASE=true the daemon "
+                "picks another registered project on startup; in file-only mode set "
+                "VIGIL_ALLOW_SELF_PROJECT=1 if you intend to run on this repo."
+            )
 
     _orchestrator = Orchestrator(config, provider)
 

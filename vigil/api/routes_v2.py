@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
-import requests as http_requests
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -54,20 +53,12 @@ def _require_config():
 
 async def _load_config_for_project_path(project_path: str, db: AsyncSession) -> VigilConfig:
     """Load VigilConfig for a project directory (vigil.yaml or DB-stored JSON)."""
-    repo = ProjectRepository(db)
-    project = await repo.get_by_path(project_path)
-    config_path = os.path.join(project_path, "vigil.yaml")
-    if os.path.isfile(config_path):
-        try:
-            return load_config(config_path)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to load config: {e}")
-    if project and project.config_json:
-        try:
-            return VigilConfig(**json.loads(project.config_json))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to parse stored config: {e}")
-    raise HTTPException(status_code=404, detail="No vigil.yaml found and no stored config")
+    from vigil.project_config_loader import load_vigil_config_for_project_path
+
+    try:
+        return await load_vigil_config_for_project_path(project_path, db)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
 
 
 def _apply_config_to_orchestrator(project_path: str, new_config: VigilConfig) -> None:
@@ -85,31 +76,49 @@ def _apply_config_to_orchestrator(project_path: str, new_config: VigilConfig) ->
 
     from vigil.core.benchmark import BenchmarkRunner
     from vigil.core.code_applier import CodeApplier
+    from vigil.core.context_engine import ContextEngine
     from vigil.core.git_ops import GitManager
+    from vigil.core.merge_queue import MergeQueue
     from vigil.core.state import StateManager
     from vigil.core.task_planner import TaskPlanner
+    from vigil.core.worktree import WorktreeManager
 
     _orchestrator.state = StateManager(project_path)
     _orchestrator.git = GitManager(project_path)
     _orchestrator.bench = BenchmarkRunner(new_config.benchmarks, project_path)
     _orchestrator.planner = TaskPlanner(_orchestrator.state, new_config)
     _orchestrator.applier = CodeApplier(project_path, new_config.project.read_only_paths)
+    _orchestrator.context_engine = ContextEngine(new_config)
+    _orchestrator.worktree_mgr = WorktreeManager(project_path)
+    _orchestrator.merge_queue = MergeQueue(
+        project_path,
+        new_config.controls.work_branch,
+        base_if_missing=new_config.pr.base_branch,
+    )
     _orchestrator._paused = True
+    _orchestrator.apply_pr_config_from_config()
 
 
 def _fallback_vigil_config_after_remove() -> None:
-    """Load vigil.yaml from cwd or Vigil package parent when no projects remain."""
-    global _config
-    import vigil
+    """Load ``vigil.yaml`` from cwd when no registered project remains.
 
-    candidates = [
-        Path(os.getcwd()) / "vigil.yaml",
-        Path(vigil.__file__).resolve().parent.parent / "vigil.yaml",
-    ]
+    Does not fall back to the Vigil package tree's ``vigil.yaml`` (that would
+    silently point the daemon at the tool source repo).
+    """
+    global _config
+    from vigil.dev_self import allow_vigil_self_project, is_vigil_source_repo_path
+
+    candidates = [Path(os.getcwd()) / "vigil.yaml"]
     for p in candidates:
         if p.is_file():
             try:
                 cfg = load_config(str(p))
+                if is_vigil_source_repo_path(cfg.project.path) and not allow_vigil_self_project():
+                    log.warning(
+                        "Skipping fallback %s — Vigil tool source repo; set VIGIL_ALLOW_SELF_PROJECT=1 to use it",
+                        p,
+                    )
+                    continue
                 _apply_config_to_orchestrator(cfg.project.path, cfg)
                 log.info("Fell back to config: %s", p)
                 return
@@ -119,29 +128,69 @@ def _fallback_vigil_config_after_remove() -> None:
 
 
 async def reconcile_startup_project() -> None:
-    """On DB-backed startup, switch the daemon to the last active project in the
-    registry when the CLI-supplied config points at a path that is not active
-    (e.g. it was removed before a restart)."""
+    """On DB-backed startup, align the daemon with the project registry.
+
+    - Never default to the Vigil tool's own source checkout when other active
+      projects exist (unless ``VIGIL_ALLOW_SELF_PROJECT`` is set).
+    - If the CLI ``vigil.yaml`` points at a path that is not active in the DB
+      (e.g. removed before restart), switch to a suitable active project.
+    """
+    from vigil.daemon_bootstrap import resolve_daemon_config_if_empty_project_path
     from vigil.db.session import get_db_manager
+    from vigil.dev_self import allow_vigil_self_project, is_vigil_source_repo_path
 
     mgr = get_db_manager()
     if mgr is None or _config is None:
+        return
+
+    if not (_config.project.path or "").strip():
+        try:
+            cfg2 = await resolve_daemon_config_if_empty_project_path(_config)
+        except ValueError as e:
+            log.warning("Startup: empty project.path and could not resolve: %s", e)
+            return
+        _apply_config_to_orchestrator(cfg2.project.path, cfg2)
         return
 
     cli_path = os.path.normpath(os.path.realpath(_config.project.path))
 
     async with mgr.session() as db:
         repo = ProjectRepository(db)
+        active = await repo.get_all_active()
+        if not active:
+            return
+
+        allow_self = allow_vigil_self_project()
+        preferred = [p for p in active if not is_vigil_source_repo_path(p.path)]
+        if not preferred and allow_self:
+            preferred = list(active)
+
+        # Prefer any non–tool-repo project over the Vigil development tree.
+        if (
+            is_vigil_source_repo_path(cli_path)
+            and not allow_self
+            and preferred
+        ):
+            target = preferred[0]
+            try:
+                cfg = await _load_config_for_project_path(target.path, db)
+            except Exception as e:
+                log.warning("Could not load config for %s on startup: %s", target.path, e)
+                return
+            _apply_config_to_orchestrator(target.path, cfg)
+            log.info(
+                "Startup reconciliation: avoided Vigil tool source repo (%s); using %s (%s)",
+                cli_path,
+                target.name,
+                target.path,
+            )
+            return
 
         cli_project = await repo.get_by_path(cli_path)
         if cli_project and cli_project.is_active:
-            return  # CLI project is already active — nothing to do.
+            return
 
-        active = await repo.get_all_active()
-        if not active:
-            return  # No active projects at all — keep CLI default.
-
-        target = active[0]  # Most recently updated
+        target = preferred[0] if preferred else active[0]
         try:
             cfg = await _load_config_for_project_path(target.path, db)
         except Exception as e:
@@ -216,6 +265,18 @@ def get_config_endpoint():
     return config.model_dump(mode="json")
 
 
+class ProviderTestBody(BaseModel):
+    provider: dict
+
+
+@router.post("/provider/test-connection")
+def test_provider_connection(body: ProviderTestBody):
+    """Minimal LLM round-trip using the given provider block (e.g. unsaved Settings draft)."""
+    from vigil.api.provider_test import run_provider_connectivity_test
+
+    return run_provider_connectivity_test(body.provider)
+
+
 class ConfigUpdate(BaseModel):
     project: dict | None = None
     provider: dict | None = None
@@ -252,6 +313,12 @@ def update_config(update: ConfigUpdate):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid configuration: {e}")
 
+    if not (new_config.project.path or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="project.path is empty. Select a project directory in Settings before saving.",
+        )
+
     old_path = _resolve_project_path(config.project.path)
     new_path = _resolve_project_path(new_config.project.path)
     if old_path != new_path:
@@ -264,6 +331,7 @@ def update_config(update: ConfigUpdate):
         from vigil.core.task_planner import TaskPlanner
 
         orch.planner = TaskPlanner(orch.state, new_config)
+        orch.apply_pr_config_from_config()
 
     if provider_changed:
         from vigil.providers import create_provider
@@ -287,63 +355,26 @@ def update_config(update: ConfigUpdate):
 # ============================================================================
 
 @router.get("/models")
-def get_available_models():
-    """Auto-detect available LLM models from Ollama and other providers."""
-    models = []
+def get_available_models(
+    ollama_base_url: str | None = None,
+    openai_base_url: str | None = None,
+):
+    """List models from Ollama ``/api/tags`` and OpenAI-compatible ``/v1/models``.
 
-    # Detect Ollama models
-    config = _config
-    ollama_url = "http://localhost:11434"
-    if config and config.provider.type == "ollama":
-        ollama_url = config.provider.base_url
+    Optional query params let Settings use **draft** base URLs before save.
+    """
+    from vigil.api.models_discovery import collect_models_for_request
 
-    try:
-        resp = http_requests.get(f"{ollama_url}/api/tags", timeout=3)
-        if resp.status_code == 200:
-            data = resp.json()
-            for m in data.get("models", []):
-                name = m.get("name", "")
-                size = m.get("size", 0)
-                size_gb = round(size / (1024**3), 1) if size else None
-                models.append({
-                    "name": name,
-                    "provider": "ollama",
-                    "size_gb": size_gb,
-                    "family": m.get("details", {}).get("family", ""),
-                    "parameter_size": m.get("details", {}).get("parameter_size", ""),
-                })
-    except Exception:
-        pass
-
-    return {
-        "models": models,
-        "ollama_available": len(models) > 0,
-    }
+    return collect_models_for_request(_config, ollama_base_url, openai_base_url)
 
 
 @router.get("/pr/status")
 def get_pr_status():
+    from vigil.api.pr_status import build_pr_status_payload
+
     orch = _require_orchestrator()
     config = _require_config()
-
-    status = {
-        "enabled": config.pr.enabled,
-        "pr_active": getattr(orch, "_pr_enabled", False),
-        "push_enabled": getattr(orch, "_pr_push_enabled", False),
-        "strategy": config.pr.strategy,
-        "base_branch": config.pr.base_branch,
-    }
-
-    if config.pr.enabled and hasattr(orch, "pr_manager") and orch.pr_manager:
-        ok, msg = orch.pr_manager.preflight_check()
-        status["preflight_ok"] = ok
-        status["preflight_message"] = msg
-    else:
-        status["preflight_ok"] = False
-        status["preflight_message"] = "PR workflow not enabled"
-        status["push_enabled"] = False
-
-    return status
+    return build_pr_status_payload(orch, config)
 
 
 # ============================================================================
@@ -438,7 +469,12 @@ async def _check_and_import_project(project_path: str, db: AsyncSession, repo: P
     """Check if a directory has vigil.yaml and import it."""
     import json as json_module
 
+    from vigil.dev_self import allow_vigil_self_project, is_vigil_source_repo_path
+
     if not os.path.isdir(project_path):
+        return
+
+    if is_vigil_source_repo_path(project_path) and not allow_vigil_self_project():
         return
 
     vigil_yaml = os.path.join(project_path, "vigil.yaml")
@@ -678,6 +714,12 @@ async def update_config_by_project(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid configuration: {e}")
 
+    if not (new_config.project.path or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="project.path is empty. Select a project directory before saving.",
+        )
+
     yaml_path = os.path.join(norm, "vigil.yaml")
     if os.path.isfile(yaml_path):
         try:
@@ -699,6 +741,7 @@ async def update_config_by_project(
         from vigil.core.task_planner import TaskPlanner
 
         _orchestrator.planner = TaskPlanner(_orchestrator.state, new_config)
+        _orchestrator.apply_pr_config_from_config()
 
     return {"message": "Config updated", "active": is_active}
 
@@ -762,6 +805,46 @@ class AnalyzeRequest(BaseModel):
     path: str
 
 
+class SuggestTasksRequest(BaseModel):
+    path: str
+    require_llm: bool = False
+
+
+def _setup_llm_status_payload() -> dict:
+    orch = _orchestrator
+    if orch is None:
+        return {
+            "ready": False,
+            "provider_name": None,
+            "provider_type": None,
+            "model": None,
+            "message": "Orchestrator not initialized.",
+        }
+    prov = getattr(orch, "provider", None)
+    if prov is None:
+        return {
+            "ready": False,
+            "provider_name": None,
+            "provider_type": None,
+            "model": None,
+            "message": "No LLM provider on the server. Set provider in vigil.yaml and restart Vigil, or use Settings.",
+        }
+    cfg_p = _config.provider if _config else None
+    return {
+        "ready": True,
+        "provider_name": prov.name(),
+        "provider_type": cfg_p.type if cfg_p else None,
+        "model": cfg_p.model if cfg_p else None,
+        "message": None,
+    }
+
+
+@router.get("/setup/llm-status")
+def setup_llm_status():
+    """Report whether an LLM provider is configured (Setup wizard, Refresh with AI)."""
+    return _setup_llm_status_payload()
+
+
 @router.post("/setup/analyze")
 def analyze_project_endpoint(req: AnalyzeRequest):
     """Analyze a project and return suggested configuration."""
@@ -797,17 +880,52 @@ def analyze_with_llm_endpoint(req: AnalyzeRequest):
 
 
 @router.post("/setup/suggest-tasks")
-def suggest_tasks_endpoint(req: AnalyzeRequest):
+def suggest_tasks_endpoint(req: SuggestTasksRequest):
     """Analyze a project and suggest prioritized tasks with rationale.
 
     When a provider is available, uses the deep 4-phase pipeline for
     project-specific, domain-aware suggestions. Falls back to the
-    original single-prompt flow on failure.
+    original single-prompt flow on failure unless ``require_llm`` is true.
     """
     if not os.path.isdir(req.path):
         raise HTTPException(status_code=400, detail="Invalid project path")
 
-    provider = _orchestrator.provider if _orchestrator else None
+    provider = getattr(_orchestrator, "provider", None) if _orchestrator else None
+
+    if req.require_llm:
+        if provider is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "LLM provider is not available. Configure provider in Settings or vigil.yaml "
+                    "and restart Vigil."
+                ),
+            )
+        try:
+            from vigil.core.deep_suggest import deep_suggest_tasks
+
+            final: dict | None = None
+            p_config = _config.provider if _config else None
+            for event_type, data in deep_suggest_tasks(req.path, provider, provider_config=p_config):
+                if event_type == "done":
+                    final = data
+            if final is not None:
+                return final
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "AI task suggestions did not complete. Check that your LLM endpoint is "
+                    "reachable and try again."
+                ),
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.warning("Deep suggest failed (require_llm): %s", e)
+            raise HTTPException(
+                status_code=503,
+                detail=f"AI task suggestions failed: {e!s}",
+            ) from e
 
     if provider is not None:
         try:
@@ -1048,9 +1166,12 @@ async def apply_setup(req: SetupApply, db: AsyncSession = Depends(get_db)):
 
         from vigil.core.benchmark import BenchmarkRunner
         from vigil.core.code_applier import CodeApplier
+        from vigil.core.context_engine import ContextEngine
         from vigil.core.git_ops import GitManager
+        from vigil.core.merge_queue import MergeQueue
         from vigil.core.state import StateManager
         from vigil.core.task_planner import TaskPlanner
+        from vigil.core.worktree import WorktreeManager
 
         try:
             _orchestrator.state = StateManager(project_path)
@@ -1058,6 +1179,16 @@ async def apply_setup(req: SetupApply, db: AsyncSession = Depends(get_db)):
             _orchestrator.bench = BenchmarkRunner(new_config.benchmarks, project_path)
             _orchestrator.planner = TaskPlanner(_orchestrator.state, new_config)
             _orchestrator.applier = CodeApplier(project_path, new_config.project.read_only_paths)
+            _orchestrator.context_engine = ContextEngine(new_config)
+            _orchestrator.worktree_mgr = WorktreeManager(project_path)
+            _orchestrator.merge_queue = MergeQueue(
+                project_path,
+                new_config.controls.work_branch,
+                base_if_missing=new_config.pr.base_branch,
+            )
+            from vigil.providers import create_provider
+
+            _orchestrator.provider = create_provider(new_config.provider)
             _orchestrator._paused = True
             log.info("Orchestrator reinitialized for project: %s", project_path)
         except Exception as e:

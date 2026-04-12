@@ -18,7 +18,7 @@ const navItems = [
   { to: "/setup", icon: FolderPlus, label: "New Project" },
   { to: "/tasks", icon: ListTodo, label: "Tasks" },
   { to: "/benchmarks", icon: BarChart3, label: "Benchmarks" },
-  { to: "/logs", icon: ScrollText, label: "Logs" },
+  { to: "/logs", icon: ScrollText, label: "Iterations" },
   { to: "/settings", icon: Settings, label: "Settings" },
 ] as const;
 

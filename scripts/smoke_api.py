@@ -31,7 +31,10 @@ def main() -> int:
     cfg = load_config(str(cfg_path))
 
     class Dummy:
-        pass
+        """Minimal orchestrator stub for CORS/HTTP smoke (no real loop)."""
+
+        def apply_pr_config_from_config(self) -> None:
+            return None
 
     app = create_app(cfg, Dummy(), None)
     with TestClient(app) as client:

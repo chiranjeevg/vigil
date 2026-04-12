@@ -7,11 +7,13 @@ import type {
   VigilConfig,
   Task,
   SuggestedTask,
+  PrStatusResponse,
 } from "@/types";
+import { parseJsonResponseBody } from "@/lib/httpJson";
 
 const API_BASE = "/api";
 
-class ApiError extends Error {
+export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
@@ -19,6 +21,17 @@ class ApiError extends Error {
     super(message);
     this.name = "ApiError";
   }
+}
+
+/** True when `fetch` or `ReadableStream` was aborted via `AbortController`. */
+export function isAbortError(e: unknown): boolean {
+  if (e instanceof DOMException && e.name === "AbortError") return true;
+  if (e instanceof Error && e.name === "AbortError") return true;
+  return false;
+}
+
+export interface AnalyzeStreamOptions {
+  signal?: AbortSignal;
 }
 
 async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
@@ -29,17 +42,43 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
     headers: new Headers(options?.headers),
   });
 
+  const text = await res.text().catch(() => "");
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "Unknown error");
-    throw new ApiError(res.status, text);
+    let msg = text || "Unknown error";
+    const ct = res.headers.get("content-type");
+    if (ct?.includes("application/json") && text.trim()) {
+      try {
+        const errBody = parseJsonResponseBody(text) as { detail?: unknown };
+        if (typeof errBody.detail === "string") {
+          msg = errBody.detail;
+        }
+      } catch {
+        /* keep raw text */
+      }
+    }
+    throw new ApiError(res.status, msg);
   }
 
   const contentType = res.headers.get("content-type");
   if (contentType?.includes("application/json")) {
-    return res.json() as Promise<T>;
+    try {
+      return parseJsonResponseBody(text) as T;
+    } catch {
+      throw new ApiError(res.status, "Response was not valid JSON");
+    }
   }
 
   return {} as T;
+}
+
+/** LLM availability for Setup (Refresh with AI, banners). */
+export interface SetupLlmStatus {
+  ready: boolean;
+  provider_name: string | null;
+  provider_type: string | null;
+  model: string | null;
+  message?: string | null;
 }
 
 export interface DeepSuggestEvent {
@@ -117,6 +156,9 @@ export function streamDeepSuggest(
 
 export const api = {
   getStatus: () => fetchApi<VigilStatus>("/status"),
+
+  /** Live git remote / push + gh auth check for PR automation */
+  getPrStatus: () => fetchApi<PrStatusResponse>("/pr/status"),
   getStats: (projectPath?: string) => {
     const q = projectPath
       ? `?project_path=${encodeURIComponent(projectPath)}`
@@ -192,6 +234,20 @@ export const api = {
       body: JSON.stringify(config),
     }),
 
+  /** Minimal LLM round-trip with unsaved provider settings (Settings draft). */
+  testProviderConnection: (provider: Record<string, unknown>) =>
+    fetchApi<{
+      ok: boolean;
+      provider_name: string;
+      latency_ms: number;
+      tokens_used: number;
+      preview: string;
+    }>("/provider/test-connection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider }),
+    }),
+
   addTask: (task: Partial<Task> & { id?: string; priority?: number }) =>
     fetchApi<void>("/tasks", {
       method: "POST",
@@ -247,25 +303,6 @@ export const api = {
       body: JSON.stringify({ path }),
     }),
 
-  suggestTasks: (path: string) =>
-    fetchApi<{
-      suggested: SuggestedTask[];
-      available: SuggestedTask[];
-      analysis: {
-        languages: string[];
-        file_count: number;
-        has_tests: boolean;
-        has_benchmarks: boolean;
-        config_files: string[];
-        is_git_repo: boolean;
-      };
-      llm_enhanced: boolean;
-    }>("/setup/suggest-tasks", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    }),
-
   applySetup: (config: Record<string, unknown>, saveToProject = true) =>
     fetchApi<{ message: string; path: string }>("/setup/apply", {
       method: "POST",
@@ -274,6 +311,8 @@ export const api = {
     }),
 
   getDefaults: () => fetchApi<Record<string, unknown>>("/setup/defaults"),
+
+  getSetupLlmStatus: () => fetchApi<SetupLlmStatus>("/setup/llm-status"),
 
   switchProject: (path: string) =>
     fetchApi<{ message: string; project_name: string; project_path: string }>(
@@ -306,8 +345,16 @@ export const api = {
       },
     ),
 
-  getModels: () =>
-    fetchApi<{
+  getModels: (opts?: { openaiBaseUrl?: string; ollamaBaseUrl?: string }) => {
+    const params = new URLSearchParams();
+    if (opts?.openaiBaseUrl?.trim()) {
+      params.set("openai_base_url", opts.openaiBaseUrl.trim());
+    }
+    if (opts?.ollamaBaseUrl?.trim()) {
+      params.set("ollama_base_url", opts.ollamaBaseUrl.trim());
+    }
+    const q = params.toString() ? `?${params.toString()}` : "";
+    return fetchApi<{
       models: {
         name: string;
         provider: string;
@@ -316,17 +363,33 @@ export const api = {
         parameter_size: string;
       }[];
       ollama_available: boolean;
-    }>("/models"),
+      openai_compatible_available?: boolean;
+    }>(`/models${q}`).then((data) => ({
+      ...data,
+      /** Backend or empty JSON may omit `models`; UI must never get undefined. */
+      models: Array.isArray(data.models) ? data.models : [],
+      ollama_available: Boolean(data.ollama_available),
+      openai_compatible_available: Boolean(data.openai_compatible_available),
+    }));
+  },
 
+  /**
+   * Stream setup analysis (scan + optional LLM). Pass `signal` from an
+   * `AbortController` so the user can cancel — closes the HTTP connection and
+   * stops reading SSE (server may finish one in-flight chunk).
+   */
   analyzeProjectStream: (
     path: string,
     onEvent: (event: AnalysisStreamEvent) => void,
+    options?: AnalyzeStreamOptions,
   ): Promise<void> => {
+    const signal = options?.signal;
     return new Promise((resolve, reject) => {
       fetch(`${API_BASE}/setup/analyze-stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path }),
+        signal,
       })
         .then((res) => {
           if (!res.ok) {
@@ -338,37 +401,86 @@ export const api = {
             reject(new Error("No reader"));
             return;
           }
+          const streamReader = reader;
           const decoder = new TextDecoder();
           let buffer = "";
 
           function pump(): Promise<void> {
-            return reader!.read().then(({ done, value }) => {
-              if (done) {
-                resolve();
-                return;
-              }
-              buffer += decoder.decode(value, { stream: true });
-              const lines = buffer.split("\n");
-              buffer = lines.pop() || "";
-              for (const line of lines) {
-                if (line.startsWith("data: ")) {
-                  try {
-                    const evt = JSON.parse(line.slice(6));
-                    onEvent(evt as AnalysisStreamEvent);
-                  } catch {
-                    // skip malformed
+            return streamReader.read().then(
+              ({ done, value }) => {
+                if (done) {
+                  resolve();
+                  return;
+                }
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                  if (line.startsWith("data: ")) {
+                    try {
+                      const evt = JSON.parse(line.slice(6));
+                      onEvent(evt as AnalysisStreamEvent);
+                    } catch {
+                      // skip malformed
+                    }
                   }
                 }
-              }
-              return pump();
-            });
+                return pump();
+              },
+              (err: unknown) => {
+                if (isAbortError(err)) {
+                  reject(err);
+                  return;
+                }
+                reject(err instanceof Error ? err : new Error(String(err)));
+              },
+            );
           }
 
-          pump().catch(reject);
+          pump().catch((err: unknown) => {
+            if (isAbortError(err)) {
+              reject(err);
+              return;
+            }
+            reject(err instanceof Error ? err : new Error(String(err)));
+          });
         })
-        .catch(reject);
+        .catch((err: unknown) => {
+          if (isAbortError(err)) {
+            reject(err);
+            return;
+          }
+          reject(err instanceof Error ? err : new Error(String(err)));
+        });
     });
   },
+
+  /** Task suggestions (may invoke LLM). Pass `signal` to allow cancellation. */
+  suggestTasks: (
+    path: string,
+    options?: { signal?: AbortSignal; requireLlm?: boolean },
+  ) =>
+    fetchApi<{
+      suggested: SuggestedTask[];
+      available: SuggestedTask[];
+      analysis: {
+        languages: string[];
+        file_count: number;
+        has_tests: boolean;
+        has_benchmarks: boolean;
+        config_files: string[];
+        is_git_repo: boolean;
+      };
+      llm_enhanced: boolean;
+    }>("/setup/suggest-tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path,
+        require_llm: options?.requireLlm ?? false,
+      }),
+      signal: options?.signal,
+    }),
 };
 
 export interface AnalysisStreamEvent {

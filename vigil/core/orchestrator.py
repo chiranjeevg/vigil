@@ -5,15 +5,16 @@ import re
 import subprocess
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from vigil.config import VigilConfig
 from vigil.core.benchmark import BenchmarkRunner
 from vigil.core.code_applier import CodeApplier
 from vigil.core.git_ops import GitManager
-from vigil.core.pr_manager import PRManager
+from vigil.core.merge_queue import MergeQueue
+from vigil.core.pr_manager import PRManager, iteration_branch_name
 from vigil.core.state import StateManager
 from vigil.core.task_planner import TaskPlanner
+from vigil.core.worktree import WorktreeManager, require_git_worktree_support
 from vigil.providers.base import BaseProvider
 
 log = logging.getLogger(__name__)
@@ -28,10 +29,20 @@ class Orchestrator:
         self.bench = BenchmarkRunner(config.benchmarks, config.project.path)
         self.planner = TaskPlanner(self.state, config)
         self.applier = CodeApplier(config.project.path, config.project.read_only_paths)
-        self.pr_manager: PRManager | None = None
+        from vigil.core.context_engine import ContextEngine
+
+        self.context_engine = ContextEngine(config)
+        # Always available for GET /api/pr/status and hot-reload (not only after start()).
+        self.pr_manager = PRManager(config.project.path, config.pr)
+        self.worktree_mgr = WorktreeManager(config.project.path)
+        self.merge_queue = MergeQueue(
+            config.project.path,
+            config.controls.work_branch,
+            base_if_missing=config.pr.base_branch,
+        )
         self._pr_enabled = False
-        # True when gh + remote + auth succeed; gates push and gh pr create only.
         self._pr_push_enabled = False
+        self._pr_gh_enabled = False
         self._running = False
         self._paused = False
         self._current_task: dict | None = None
@@ -40,55 +51,101 @@ class Orchestrator:
         self._daily_count = 0
         self._no_improve_streak = 0
         self._start_time: datetime | None = None
+        self._iteration_branch_label: str | None = None
+
+    def _fork_parent_ref(self) -> str:
+        """Branch to fork each iteration worktree from (independent iterations)."""
+        if self.config.pr.enabled:
+            return self.config.pr.base_branch
+        return self.config.controls.work_branch
+
+    def apply_pr_config_from_config(self) -> None:
+        """Refresh PRManager and preflight flags from ``self.config`` (startup and PUT /config)."""
+        self.pr_manager = PRManager(self.config.project.path, self.config.pr)
+        self._pr_push_enabled = False
+        self._pr_gh_enabled = False
+        self._pr_enabled = bool(self.config.pr.enabled)
+
+        if self.config.pr.enabled:
+            push_ok, push_msg = self.pr_manager.preflight_push()
+            gh_ok, gh_msg = self.pr_manager.preflight_gh_pr()
+            self._pr_push_enabled = push_ok
+            self._pr_gh_enabled = gh_ok
+            if push_ok and gh_ok:
+                log.info(
+                    "PR section enabled — push + gh pr create ready (base %s)",
+                    self.config.pr.base_branch,
+                )
+            elif push_ok:
+                log.warning(
+                    "Git push enabled; gh pr disabled (%s). Branches will push; open PRs manually or fix gh.",
+                    gh_msg,
+                )
+            elif gh_ok:
+                log.warning(
+                    "gh ready but push disabled (%s). Configure origin to push branches.",
+                    push_msg,
+                )
+            else:
+                log.warning(
+                    "PR automation limited — push: %s; gh: %s",
+                    push_msg,
+                    gh_msg,
+                )
+
+            _pr_msgs = []
+            if not push_ok:
+                _pr_msgs.append(push_msg)
+            if not gh_ok:
+                _pr_msgs.append(gh_msg)
+            self._broadcast(
+                "pr_status",
+                {
+                    "enabled": True,
+                    "push_enabled": push_ok,
+                    "gh_pr_enabled": gh_ok,
+                    "preflight_message": (
+                        " ".join(_pr_msgs) if _pr_msgs else "PR workflow ready"
+                    ),
+                },
+            )
+        else:
+            log.info(
+                "PR disabled — local iteration branches from %s via worktrees",
+                self._fork_parent_ref(),
+            )
+            self._broadcast(
+                "pr_status",
+                {
+                    "enabled": False,
+                    "push_enabled": False,
+                    "gh_pr_enabled": False,
+                    "preflight_message": "PR disabled — local iteration branches only",
+                },
+            )
 
     def start(self) -> None:
         self._running = True
         self._start_time = datetime.now(timezone.utc)
         log.info("Vigil starting — provider: %s", self.provider.name())
 
-        if self.config.pr.enabled:
-            self.pr_manager = PRManager(self.config.project.path, self.config.pr)
-            push_ok, push_msg = self.pr_manager.preflight_check()
-            # Local vigil/* branches do not require gh or a remote; only push/PR does.
-            self._pr_enabled = True
-            self._pr_push_enabled = push_ok
-            if push_ok:
-                log.info(
-                    "PR section enabled — iteration branches from %s; push/PR enabled",
-                    self.config.pr.base_branch,
-                )
-            else:
-                log.warning(
-                    "PR push disabled (%s). Local vigil/* iteration branches are still created.",
-                    push_msg,
-                )
+        try:
+            require_git_worktree_support()
+        except RuntimeError as e:
+            log.error("%s", e)
+            self._running = False
+            return
 
-            restored = self.state.get_last_successful_branch()
-            if restored and self.pr_manager.local_branch_exists(restored):
-                self.pr_manager.set_last_successful_branch(restored)
-                log.info(
-                    "Restored iterative branch chain — next iteration forks from %s",
-                    restored,
-                )
-            elif restored:
-                log.warning(
-                    "Stored iterative branch %s not found locally — resetting chain to %s",
-                    restored,
-                    self.config.pr.base_branch,
-                )
-                self.state.set_last_successful_branch(None)
+        try:
+            self.merge_queue.ensure_worktree()
+        except Exception as e:
+            log.warning("Merge queue worktree not ready (merges may fail): %s", e)
 
-            self._broadcast(
-                "pr_status",
-                {
-                    "enabled": True,
-                    "push_enabled": push_ok,
-                    "preflight_message": push_msg,
-                },
-            )
+        removed = self.worktree_mgr.cleanup_stale()
+        if removed:
+            log.info("Removed %d stale worktree path(s) on startup", removed)
 
-        if not self._pr_enabled:
-            self.git.ensure_branch(self.config.controls.work_branch)
+        self.apply_pr_config_from_config()
 
         self._run_loop()
 
@@ -121,7 +178,9 @@ class Orchestrator:
         }
 
     def _current_branch_label(self) -> str:
-        """Actual git HEAD branch (PR iteration branch or work_branch)."""
+        """Main repo branch; during iteration prefer the iteration branch name."""
+        if self._iteration_branch_label:
+            return self._iteration_branch_label
         b = self.git.get_current_branch()
         return b if b else self.config.controls.work_branch
 
@@ -129,6 +188,11 @@ class Orchestrator:
         uptime = 0.0
         if self._start_time:
             uptime = (datetime.now(timezone.utc) - self._start_time).total_seconds()
+        mq_head = ""
+        try:
+            mq_head = self.merge_queue.current_head()
+        except Exception:
+            pass
         return {
             "running": self._running,
             "paused": self._paused,
@@ -141,6 +205,8 @@ class Orchestrator:
             "branch": self._current_branch_label(),
             "project_name": self.config.project.name,
             "project_path": self.config.project.path,
+            "merge_branch": self.config.controls.work_branch,
+            "merge_queue_head": mq_head,
         }
 
     def _run_loop(self) -> None:
@@ -197,27 +263,85 @@ class Orchestrator:
             "no_improve_streak": self._no_improve_streak,
         })
 
-        pr_branch: str | None = None
-        if self._pr_enabled and self.pr_manager:
-            ilog.begin_step("Creating iteration branch")
-            try:
-                pr_branch = self.pr_manager.create_iteration_branch(
-                    iteration, task["type"], task.get("description", ""),
-                )
-                parent = self.pr_manager.parent_branch
-                ilog.end_step(f"Branch: {pr_branch} (from {parent})")
-            except Exception as e:
-                log.error("Failed to create PR branch: %s — falling back to work branch", e)
-                self.git.ensure_branch(self.config.controls.work_branch)
-                ilog.end_step(f"Failed: {e} — using work branch")
+        pr_branch = iteration_branch_name(
+            iteration, task["type"], task.get("description", ""),
+        )
+        parent = self._fork_parent_ref()
+        wt_handle = None
+        iter_git: GitManager | None = None
+        self._iteration_branch_label = pr_branch
+
+        _provider_name = self.provider.name()
+
+        def _finalize_failure(
+            status: str,
+            summary: str,
+            bench: dict | None = None,
+            *,
+            delete_iteration_branch: bool = True,
+            **kw,
+        ) -> None:
+            entry = ilog.to_dict(
+                status, summary, bench or {},
+                branch_name=pr_branch,
+                provider_name=_provider_name,
+                **kw,
+            )
+            self.state.save_iteration(entry)
+            self._current_ilog = None
+            self._iteration_branch_label = None
+            self._no_improve_streak += 1
+            self._broadcast("iteration_complete", {
+                "iteration": iteration, "status": status, "summary": summary,
+                "duration_ms": entry.get("duration_ms", 0),
+            })
+            if wt_handle is not None:
+                self.worktree_mgr.remove(wt_handle, delete_branch=delete_iteration_branch)
+
+        if not self.pr_manager or not self.pr_manager.local_branch_exists(parent):
+            ilog.begin_step("Iteration workspace")
+            ilog.end_step(
+                f"Missing local branch {parent!r} — create it or set pr.base_branch / controls.work_branch"
+            )
+            _finalize_failure(
+                "config_error",
+                f"Fork parent branch {parent!r} does not exist locally",
+                delete_iteration_branch=False,
+            )
+            return
+
+        try:
+            ilog.begin_step("Creating iteration worktree")
+            wt_handle = self.worktree_mgr.create(pr_branch, parent)
+            ilog.end_step(f"Worktree: {wt_handle.path} (branch {pr_branch} from {parent})")
+        except Exception as e:
+            log.error("Failed to create iteration worktree: %s", e)
+            ilog.end_step(f"Failed: {e}")
+            _finalize_failure("worktree_error", str(e), delete_iteration_branch=False)
+            return
+
+        iter_git = GitManager(str(wt_handle.path))
+        iter_applier = CodeApplier(
+            str(wt_handle.path),
+            self.config.project.read_only_paths,
+        )
+        iter_bench = BenchmarkRunner(self.config.benchmarks, str(wt_handle.path))
+        wt_root = wt_handle.path
 
         ilog.begin_step("Building context")
-        context = self._build_context(task)
+        context = self.context_engine.build(
+            task,
+            progress_summary=self.state.get_progress_summary(last_n=10),
+            recent_benchmarks=self.state.get_recent_benchmarks(last_n=5),
+            completed_tasks=self.state.get_completed_tasks(last_n=10),
+            project_root=wt_root,
+        )
         file_count = len(context.get("file_contents", {}))
         ilog.end_step({
             "files_scanned": file_count,
             "file_tree_lines": len(context.get("file_tree", "").splitlines()),
             "files_included": list(context.get("file_contents", {}).keys()),
+            "reference_docs": list(context.get("reference_docs", {}).keys()),
         })
 
         from vigil.prompts.system import get_system_prompt
@@ -229,27 +353,6 @@ class Orchestrator:
             "system_prompt_len": len(system_prompt),
             "user_prompt_len": len(user_prompt),
         })
-
-        _provider_name = self.provider.name()
-        _work_branch = pr_branch or self.config.controls.work_branch
-
-        def _finalize_failure(status: str, summary: str, bench: dict | None = None, **kw):
-            """Save a failed iteration and clean up the branch."""
-            entry = ilog.to_dict(
-                status, summary, bench or {},
-                branch_name=_work_branch,
-                provider_name=_provider_name,
-                **kw,
-            )
-            self.state.save_iteration(entry)
-            self._current_ilog = None
-            if pr_branch and self.pr_manager:
-                self.pr_manager.cleanup_branch(pr_branch)
-            self._no_improve_streak += 1
-            self._broadcast("iteration_complete", {
-                "iteration": iteration, "status": status, "summary": summary,
-                "duration_ms": entry.get("duration_ms", 0),
-            })
 
         ilog.begin_step("LLM inference")
         try:
@@ -309,7 +412,7 @@ class Orchestrator:
             return
 
         ilog.begin_step("Parsing & applying changes")
-        changes, blocked_readonly = self.applier.parse_and_apply(response.text)
+        changes, blocked_readonly = iter_applier.parse_and_apply(response.text)
         end_apply: dict = {
             "changes_applied": len(changes),
             "changes": changes,
@@ -337,14 +440,14 @@ class Orchestrator:
             return
 
         ilog.begin_step("Validating change size")
-        ok, validation_msg = self.applier.validate_changes(
+        ok, validation_msg = iter_applier.validate_changes(
             changes,
             self.config.controls.max_files_per_iteration,
             self.config.controls.max_lines_changed,
         )
         if not ok:
             ilog.end_step(validation_msg)
-            self.git.revert_all()
+            iter_git.revert_all()
             ilog.add_step(
                 "Working tree reverted",
                 "All edits from this iteration were discarded so the repo matches the pre-iteration state.",
@@ -366,14 +469,14 @@ class Orchestrator:
         test_output = ""
         if self.config.controls.require_test_pass and self.config.tests.command:
             ilog.begin_step(f"Running tests: {self.config.tests.command}")
-            test_ok, test_output = self._run_tests_capture()
+            test_ok, test_output = self._run_tests_capture(cwd=str(wt_root))
             ilog.end_step({
                 "passed": test_ok,
                 "output_lines": len(test_output.splitlines()),
                 "output_preview": test_output[:2000],
             })
             if not test_ok:
-                self.git.revert_all()
+                iter_git.revert_all()
                 ilog.add_step("Tests failed — changes reverted")
                 _finalize_failure(
                     "tests_failed", "Tests failed after changes",
@@ -391,10 +494,10 @@ class Orchestrator:
         bench_result = None
         if self.config.benchmarks.enabled and iteration % self.config.benchmarks.run_every == 0:
             ilog.begin_step(f"Running benchmarks: {self.config.benchmarks.command}")
-            bench_result = self.bench.run_and_compare()
+            bench_result = iter_bench.run_and_compare()
             ilog.end_step(bench_result or "No result")
             if bench_result and bench_result.get("delta_pct", 0) < self.config.benchmarks.regression_threshold:
-                self.git.revert_all()
+                iter_git.revert_all()
                 ilog.add_step(f"Benchmark regression ({bench_result['delta_pct']:.2f}%) — changes reverted")
                 _finalize_failure(
                     "benchmark_regression",
@@ -412,7 +515,7 @@ class Orchestrator:
                 return
 
         files_changed = [c["file"] for c in changes]
-        diff_before_commit = self.git.get_diff()
+        diff_before_commit = iter_git.get_diff()
 
         ilog.begin_step("Committing changes")
         commit_msg = f"{self.config.controls.commit_prefix}: {task['type']} — {task['description']}"
@@ -421,10 +524,29 @@ class Orchestrator:
             if first_line and len(first_line) < 200:
                 commit_msg += f"\n\n{analysis_text[:500]}"
         commit_hash = ""
-        if self.git.has_changes():
-            self.git.commit(commit_msg)
-            commit_hash = self.git.get_last_commit_hash()
+        if iter_git.has_changes():
+            iter_git.commit(commit_msg)
+            commit_hash = iter_git.get_last_commit_hash()
         ilog.end_step({"commit_hash": commit_hash, "message": commit_msg})
+
+        merge_ok = False
+        merge_msg = ""
+        try:
+            ilog.begin_step("Merge queue (into work branch)")
+            mr = self.merge_queue.try_merge(
+                pr_branch,
+                merge_message=f"vigil: merge {pr_branch}",
+            )
+            merge_ok = mr.success
+            merge_msg = mr.message
+            if mr.success:
+                ilog.end_step({"merged": True, "commit": mr.commit_hash})
+            else:
+                ilog.end_step({"merged": False, "detail": merge_msg[:500]})
+        except Exception as e:
+            log.warning("Merge queue error: %s", e)
+            ilog.end_step(f"Merge queue error: {e}")
+            merge_msg = str(e)
 
         summary = f"Applied {len(changes)} change(s)"
         if analysis_text:
@@ -434,37 +556,65 @@ class Orchestrator:
         if bench_result:
             summary += f", benchmark delta: {bench_result.get('delta_pct', 0):.2f}%"
             self.state.save_benchmark(bench_result)
+        if not merge_ok:
+            summary += f" — merge queue: {merge_msg[:200]}"
 
         pr_url = None
-        if pr_branch and self.pr_manager:
-            self.pr_manager.mark_success(pr_branch)
-            self.state.set_last_successful_branch(pr_branch)
-
-            if self._pr_push_enabled:
-                ilog.begin_step("Creating pull request")
-                pr_url = self._create_pr(pr_branch, task, bench_result)
-                if pr_url:
-                    summary += f" — PR: {pr_url}"
-                ilog.end_step(pr_url or "PR creation failed")
+        if self.pr_manager:
+            if self.config.pr.enabled:
+                if not self.config.pr.auto_push:
+                    ilog.add_step(
+                        "Push skipped",
+                        "pr.auto_push is false — set true in vigil.yaml to push after each iteration.",
+                    )
+                elif self._pr_push_enabled:
+                    ilog.begin_step("Pushing branch to origin")
+                    pushed_ok, push_err = self.pr_manager.push_branch(pr_branch)
+                    ilog.end_step(
+                        "Pushed to origin"
+                        if pushed_ok
+                        else f"Failed: {push_err[:800]}",
+                    )
+                    if pushed_ok and self._pr_gh_enabled:
+                        ilog.begin_step("Creating pull request")
+                        pr_url = self._create_pr(iter_git, pr_branch, task, bench_result)
+                        if pr_url:
+                            summary += f" — PR: {pr_url}"
+                        ilog.end_step(pr_url or "PR creation failed")
+                    elif pushed_ok and not self._pr_gh_enabled:
+                        ilog.add_step(
+                            "PR not created automatically",
+                            "Branch pushed to origin. Install and authenticate GitHub CLI (gh) "
+                            "for automatic PRs, or open a PR manually on GitHub.",
+                        )
+                else:
+                    ilog.add_step(
+                        "Push skipped",
+                        "No git remote or git unavailable — add `origin` to push branches.",
+                    )
             else:
                 ilog.add_step(
-                    "PR push skipped",
-                    "Add a git remote and run `gh auth login` to push branches and open PRs.",
+                    "Local iteration branch",
+                    f"Set pr.enabled: true in vigil.yaml to push and open PRs. Branch: {pr_branch}",
                 )
 
-            self.pr_manager.stay_on_branch(pr_branch)
-            log.info("Staying on branch %s for next iteration to build upon", pr_branch)
+        final_status = "success" if merge_ok else "merge_conflict"
+        if not merge_ok and commit_hash:
+            summary = (
+                f"{summary} (iteration commit OK; merge into {self.config.controls.work_branch} failed — "
+                f"resolve conflicts manually or delete branch {pr_branch})"
+            )
 
         final_diff = ""
         if commit_hash:
-            final_diff = self.git.get_commit_diff(commit_hash)
+            final_diff = iter_git.get_commit_diff(commit_hash)
         if not final_diff:
             final_diff = diff_before_commit
 
         ilog.add_step("Iteration complete", summary)
 
         entry = ilog.to_dict(
-            "success", summary, bench_result or {},
+            final_status, summary, bench_result or {},
             files_changed=files_changed,
             diff=final_diff,
             commit_hash=commit_hash,
@@ -475,18 +625,22 @@ class Orchestrator:
             llm_duration_s=response.duration_seconds,
             changes_detail=changes,
             test_output=test_output,
-            branch_name=pr_branch or self.config.controls.work_branch,
+            branch_name=pr_branch,
             provider_name=self.provider.name(),
         )
         self.state.save_iteration(entry)
         self._current_ilog = None
+        self._iteration_branch_label = None
+
+        if wt_handle is not None:
+            self.worktree_mgr.remove(wt_handle, delete_branch=False)
 
         self._no_improve_streak = 0
         self._daily_count += 1
-        log.info("Iteration %d succeeded: %s", iteration, summary)
+        log.info("Iteration %d finished: %s", iteration, summary)
         self._broadcast("iteration_complete", {
             "iteration": iteration,
-            "status": "success",
+            "status": final_status,
             "summary": summary,
             "pr_url": pr_url,
             "duration_ms": entry.get("duration_ms", 0),
@@ -496,12 +650,13 @@ class Orchestrator:
         ok, _ = self._run_tests_capture()
         return ok
 
-    def _run_tests_capture(self) -> tuple[bool, str]:
+    def _run_tests_capture(self, cwd: str | None = None) -> tuple[bool, str]:
+        root = cwd if cwd is not None else self.config.project.path
         try:
             result = subprocess.run(
                 self.config.tests.command,
                 shell=True,
-                cwd=self.config.project.path,
+                cwd=root,
                 capture_output=True,
                 text=True,
                 timeout=self.config.tests.timeout,
@@ -512,11 +667,17 @@ class Orchestrator:
             log.warning("Tests timed out")
             return False, "Tests timed out"
 
-    def _create_pr(self, branch: str, task: dict, bench_result: dict | None) -> str | None:
+    def _create_pr(
+        self,
+        iter_git: GitManager,
+        branch: str,
+        task: dict,
+        bench_result: dict | None,
+    ) -> str | None:
         """Generate PR description and create the pull request."""
-        commit_hash = self.git.get_last_commit_hash()
-        diff = self.git.get_commit_diff(commit_hash)
-        files = self.git.get_commit_files(commit_hash)
+        commit_hash = iter_git.get_last_commit_hash()
+        diff = iter_git.get_commit_diff(commit_hash)
+        files = iter_git.get_commit_files(commit_hash)
 
         if self.config.pr.use_llm_description:
             try:
@@ -553,64 +714,9 @@ class Orchestrator:
         elif len(files) <= 3:
             title += f" [{', '.join(files)}]"
 
-        return self.pr_manager.push_and_create_pr(branch, title, pr_body)
-
-    def _build_context(self, task: dict) -> dict:
-        project_path = Path(self.config.project.path)
-        context: dict = {}
-
-        context["file_tree"] = self._get_file_tree(project_path)
-        context["progress_summary"] = self.state.get_progress_summary(last_n=10)
-        context["recent_benchmarks"] = self.state.get_recent_benchmarks(last_n=5)
-        context["completed_tasks"] = self.state.get_completed_tasks(last_n=10)
-
-        target_files = task.get("target_files", [])
-        file_contents: dict[str, str] = {}
-
-        if target_files:
-            for fpath in target_files:
-                full = project_path / fpath
-                if full.exists() and full.is_file():
-                    try:
-                        file_contents[fpath] = full.read_text(errors="replace")[:10000]
-                    except OSError:
-                        pass
-        else:
-            # Pick files based on task type by scanning include paths
-            for inc in self.config.project.include_paths:
-                inc_path = project_path / inc
-                if not inc_path.exists():
-                    continue
-                for f in sorted(inc_path.rglob("*")):
-                    if f.is_file() and not self._is_excluded(f, project_path):
-                        rel = str(f.relative_to(project_path))
-                        if len(file_contents) >= 10:
-                            break
-                        try:
-                            file_contents[rel] = f.read_text(errors="replace")[:10000]
-                        except OSError:
-                            pass
-
-        context["file_contents"] = file_contents
-        return context
-
-    def _get_file_tree(self, project_path: Path) -> str:
-        lines: list[str] = []
-        for inc in self.config.project.include_paths:
-            inc_path = project_path / inc
-            if not inc_path.exists():
-                continue
-            for f in sorted(inc_path.rglob("*")):
-                if f.is_file() and not self._is_excluded(f, project_path):
-                    lines.append(str(f.relative_to(project_path)))
-        return "\n".join(lines[:200])
-
-    def _is_excluded(self, filepath: Path, project_path: Path) -> bool:
-        rel = str(filepath.relative_to(project_path))
-        for exc in self.config.project.exclude_paths:
-            if rel.startswith(exc) or f"/{exc}" in rel:
-                return True
-        return False
+        if not self.pr_manager:
+            return None
+        return self.pr_manager.create_pr_with_gh(branch, title, pr_body)
 
     def _check_battery_pause(self) -> bool:
         if not self.config.controls.pause_on_battery:

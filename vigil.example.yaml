@@ -1,8 +1,11 @@
 # Vigil Configuration
 # Copy this file to vigil.yaml and customize for your project.
 
+# Project — all keys below have defaults in Vigil; only `path` is needed for file-only mode.
+# With VIGIL_USE_DATABASE=true you may omit the whole `project` section, set `path: ""`, or
+# omit `path` and choose the working repository in the dashboard (Setup / Switch daemon).
 project:
-  # Absolute path to your project
+  # Absolute path to your project (optional when using the database + UI to select a repo)
   path: /path/to/your/project
   # Programming language: java, python, cpp, rust, go, typescript, auto
   language: auto

@@ -30,17 +30,23 @@ function CollapsibleSection({
   icon,
   defaultOpen = false,
   badge,
+  anchorId,
   children,
 }: {
   title: string;
   icon: React.ReactNode;
   defaultOpen?: boolean;
   badge?: string;
+  /** For in-page navigation (scroll-mt leaves room under sticky bars). */
+  anchorId?: string;
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="rounded-lg border border-slate-200 bg-slate-50/80 dark:border-slate-700/40 dark:bg-slate-900/30">
+    <div
+      id={anchorId}
+      className="scroll-mt-20 rounded-lg border border-slate-200 bg-slate-50/80 dark:border-slate-700/40 dark:bg-slate-900/30"
+    >
       <button
         type="button"
         onClick={() => setOpen(!open)}
@@ -167,6 +173,11 @@ function PromptViewer({ content }: { content: string }) {
   );
 }
 
+function scrollToSection(id: string) {
+  if (typeof document === "undefined") return;
+  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
 /**
  * Full iteration detail: timeline, prompts, LLM output, files, diff, tests — same content as Logs expand view.
  */
@@ -174,10 +185,13 @@ export function IterationDetailView({
   detail,
   loading,
   emptyHint,
+  showSectionNav = true,
 }: {
   detail: Iteration | null;
   loading?: boolean;
   emptyHint?: string;
+  /** Sticky jump links: Timeline, LLM, Files, Diff, Tests */
+  showSectionNav?: boolean;
 }) {
   if (loading) {
     return (
@@ -196,8 +210,38 @@ export function IterationDetailView({
 
   const it = detail;
 
+  const navEntries: { id: string; label: string }[] = [];
+  if (it.steps && it.steps.length > 0) navEntries.push({ id: "iteration-section-timeline", label: "Timeline" });
+  if (it.llm_prompt_system || it.llm_prompt_user || it.llm_response)
+    navEntries.push({ id: "iteration-section-llm", label: "LLM" });
+  if (it.files_changed && it.files_changed.length > 0)
+    navEntries.push({ id: "iteration-section-files", label: "Files" });
+  if (it.diff) navEntries.push({ id: "iteration-section-diff", label: "Code diff" });
+  if (it.test_output) navEntries.push({ id: "iteration-section-tests", label: "Tests" });
+
   return (
     <div className="space-y-4">
+      {showSectionNav && navEntries.length > 0 && (
+        <nav
+          className="sticky top-0 z-10 flex flex-wrap items-center gap-1.5 rounded-lg border border-slate-200 bg-white/95 px-2 py-2 shadow-sm backdrop-blur dark:border-slate-700/50 dark:bg-slate-900/90"
+          aria-label="Jump to iteration sections"
+        >
+          <span className="mr-1 hidden text-[10px] font-semibold uppercase tracking-wider text-slate-500 sm:inline">
+            View
+          </span>
+          {navEntries.map(({ id, label }) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => scrollToSection(id)}
+              className="rounded-md border border-transparent px-2.5 py-1 text-xs font-medium text-slate-700 transition-colors hover:border-slate-300 hover:bg-slate-100 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:bg-slate-800/80"
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+      )}
+
       <div className="flex flex-wrap items-center gap-3 rounded-lg bg-slate-100/90 px-4 py-3 dark:bg-slate-800/40">
         <span className="max-w-full whitespace-pre-wrap break-words text-sm text-slate-800 dark:text-slate-300">
           {it.summary}
@@ -244,49 +288,54 @@ export function IterationDetailView({
           icon={<Clock className="h-3 w-3" />}
           defaultOpen
           badge={`${it.steps.length} steps`}
+          anchorId="iteration-section-timeline"
         >
           <StepTimeline steps={it.steps} />
         </CollapsibleSection>
       )}
 
-      {(it.llm_prompt_system || it.llm_prompt_user) && (
-        <CollapsibleSection
-          title="LLM prompts"
-          icon={<MessageSquare className="h-3 w-3" />}
-          badge={`sys: ${(it.llm_prompt_system?.length ?? 0).toLocaleString()} · user: ${(it.llm_prompt_user?.length ?? 0).toLocaleString()} chars`}
-        >
-          <div className="space-y-3">
-            {it.llm_prompt_system && (
-              <div>
-                <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-500">
-                  System prompt
-                </p>
-                <PromptViewer content={it.llm_prompt_system} />
+      {((it.llm_prompt_system || it.llm_prompt_user) || it.llm_response) && (
+        <div id="iteration-section-llm" className="scroll-mt-20 space-y-4">
+          {(it.llm_prompt_system || it.llm_prompt_user) && (
+            <CollapsibleSection
+              title="LLM prompts"
+              icon={<MessageSquare className="h-3 w-3" />}
+              badge={`sys: ${(it.llm_prompt_system?.length ?? 0).toLocaleString()} · user: ${(it.llm_prompt_user?.length ?? 0).toLocaleString()} chars`}
+            >
+              <div className="space-y-3">
+                {it.llm_prompt_system && (
+                  <div>
+                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-500">
+                      System prompt
+                    </p>
+                    <PromptViewer content={it.llm_prompt_system} />
+                  </div>
+                )}
+                {it.llm_prompt_user && (
+                  <div>
+                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-500">
+                      User prompt (task + context)
+                    </p>
+                    <PromptViewer content={it.llm_prompt_user} />
+                  </div>
+                )}
               </div>
-            )}
-            {it.llm_prompt_user && (
-              <div>
-                <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-500">
-                  User prompt (task + context)
-                </p>
-                <PromptViewer content={it.llm_prompt_user} />
-              </div>
-            )}
-          </div>
-        </CollapsibleSection>
-      )}
+            </CollapsibleSection>
+          )}
 
-      {it.llm_response && (
-        <CollapsibleSection
-          title="LLM response"
-          icon={<Bot className="h-3 w-3" />}
-          badge={`${it.llm_response.length.toLocaleString()} chars`}
-          defaultOpen
-        >
-          <pre className="max-h-[min(70vh,32rem)] overflow-auto whitespace-pre-wrap rounded-lg border border-slate-200 bg-slate-100 p-3 font-mono text-[11px] leading-relaxed text-slate-800 dark:border-transparent dark:bg-slate-950 dark:text-slate-300">
-            {it.llm_response}
-          </pre>
-        </CollapsibleSection>
+          {it.llm_response && (
+            <CollapsibleSection
+              title="LLM response (explanation)"
+              icon={<Bot className="h-3 w-3" />}
+              badge={`${it.llm_response.length.toLocaleString()} chars`}
+              defaultOpen
+            >
+              <pre className="max-h-[min(70vh,32rem)] overflow-auto whitespace-pre-wrap rounded-lg border border-slate-200 bg-slate-100 p-3 font-mono text-[11px] leading-relaxed text-slate-800 dark:border-transparent dark:bg-slate-950 dark:text-slate-300">
+                {it.llm_response}
+              </pre>
+            </CollapsibleSection>
+          )}
+        </div>
       )}
 
       {it.files_changed && it.files_changed.length > 0 && (
@@ -295,6 +344,7 @@ export function IterationDetailView({
           icon={<FileCode className="h-3 w-3" />}
           defaultOpen
           badge={`${it.files_changed.length} files`}
+          anchorId="iteration-section-files"
         >
           <div className="space-y-1">
             {it.changes_detail && it.changes_detail.length > 0
@@ -328,6 +378,7 @@ export function IterationDetailView({
           title="Git diff"
           icon={<GitCommitHorizontal className="h-3 w-3" />}
           badge={`${it.diff.split("\n").length} lines`}
+          anchorId="iteration-section-diff"
         >
           <DiffViewer diff={it.diff} />
         </CollapsibleSection>
@@ -338,6 +389,7 @@ export function IterationDetailView({
           title="Test output"
           icon={<FlaskConical className="h-3 w-3" />}
           badge={it.status === "tests_failed" ? "FAILED" : "output"}
+          anchorId="iteration-section-tests"
         >
           <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-lg border border-slate-200 bg-slate-100 p-3 font-mono text-[11px] leading-relaxed text-slate-800 dark:border-transparent dark:bg-slate-950 dark:text-slate-300">
             {it.test_output}

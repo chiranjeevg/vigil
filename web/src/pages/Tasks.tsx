@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { api, streamDeepSuggest } from "@/lib/api";
+import { NewProjectLink } from "@/components/NewProjectLink";
 import { type VigilProjectListItem } from "@/lib/pathUtils";
 import type { CustomTask, VigilConfig, SuggestedTask } from "@/types";
 
@@ -72,9 +73,21 @@ export function Tasks() {
 
   const taskPathForAI = selectedProject || config?.project?.path || "";
 
-  useEffect(() => {
+  const loadProjects = useCallback(() => {
     api.getVigilProjects().then((r) => setProjects(r.projects || []));
   }, []);
+
+  useEffect(() => {
+    loadProjects();
+  }, [loadProjects]);
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible") loadProjects();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [loadProjects]);
 
   useEffect(() => {
     setLoading(true);
@@ -257,7 +270,16 @@ export function Tasks() {
   async function handleSave() {
     setSaving(true);
     try {
-      const taskUpdate = { tasks: { priorities, custom: customTasks, instructions } };
+      // priority_mode is not managed here; preserve the existing value from the API.
+      // We cast to satisfy the type — the backend merges this partial safely.
+      const taskUpdate = {
+        tasks: {
+          priorities,
+          custom: customTasks,
+          instructions,
+          priority_mode: "improver" as const,
+        },
+      };
       if (selectedProject) {
         await api.updateConfigByProject(selectedProject, taskUpdate);
       } else {
@@ -282,25 +304,25 @@ export function Tasks() {
             <span className="font-medium text-slate-800 dark:text-slate-300">{projectName}</span>
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          {projects.length > 0 && (
-            <div className="relative">
-              <FolderOpen className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-              <select
-                value={selectedProject}
-                onChange={(e) => setSelectedProject(e.target.value)}
-                className="appearance-none rounded-lg border border-slate-300 bg-white py-2 pl-9 pr-8 text-xs font-medium text-slate-800 outline-none transition-colors hover:border-slate-400 focus:border-blue-500 dark:border-slate-700/50 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:border-slate-600"
-              >
-                <option value="">Active daemon (default)</option>
-                {projects.map((p) => (
-                  <option key={p.path} value={p.path}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-            </div>
-          )}
+        <div className="flex flex-wrap items-center gap-3">
+          <NewProjectLink variant="subtle" />
+          <div className="relative min-w-[200px]">
+            <FolderOpen className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+            <select
+              value={selectedProject}
+              onChange={(e) => setSelectedProject(e.target.value)}
+              className="w-full appearance-none rounded-lg border border-slate-300 bg-white py-2 pl-9 pr-8 text-xs font-medium text-slate-800 outline-none transition-colors hover:border-slate-400 focus:border-blue-500 dark:border-slate-700/50 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:border-slate-600"
+              aria-label="Project for task configuration"
+            >
+              <option value="">Active daemon (default)</option>
+              {projects.map((p) => (
+                <option key={p.path} value={p.path}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+          </div>
           <button
             onClick={handleSave}
             disabled={saving || loading}

@@ -197,7 +197,9 @@ class CoverageConfig(BaseModel):
 
 
 class ProjectConfig(BaseModel):
-    path: str
+    # Empty string is allowed: with VIGIL_USE_DATABASE=true the daemon resolves the
+    # working repo from the dashboard registry (see daemon_bootstrap).
+    path: str = ""
     language: str = "auto"
     name: str = "My Project"
     include_paths: list[str] = ["src/", "lib/", "test/", "tests/"]
@@ -242,6 +244,17 @@ class TaskPriority(str, Enum):
     REFACTOR = "refactor"
 
 
+class PriorityMode(str, Enum):
+    """Controls how Vigil selects work each iteration.
+
+    ``improver``: original behaviour — walk the static ``tasks.priorities`` list.
+    ``engineer``: forward-work first — goals → bugs/features from work sources →
+                  improvements only when no actionable work remains.
+    """
+    IMPROVER = "improver"
+    ENGINEER = "engineer"
+
+
 class CustomTask(BaseModel):
     id: str
     description: str
@@ -253,6 +266,62 @@ class TasksConfig(BaseModel):
     priorities: list[str] = [e.value for e in TaskPriority]
     custom: list[CustomTask] = []
     instructions: dict[str, str] = {}
+    # "improver" preserves existing behaviour; "engineer" enables work-source-driven flow.
+    priority_mode: str = PriorityMode.IMPROVER.value
+
+
+# ---------------------------------------------------------------------------
+# Goals — user-defined forward work Vigil prioritises above all improvements
+# ---------------------------------------------------------------------------
+
+class GoalItem(BaseModel):
+    """A single concrete goal for Vigil to work toward.
+
+    Vigil will attempt goal tasks before any improvement-type work.
+    Attach ``context_files`` for the files that need to change and
+    ``context_docs`` for design documents / PRDs the LLM should read
+    as requirements — not edit.
+    """
+    id: str
+    description: str
+    # 1 = most urgent, 5 = nice-to-have (matches GitHub label convention P1-P5)
+    priority: int = Field(default=1, ge=1, le=5)
+    context_files: list[str] = []
+    context_docs: list[str] = []
+    # Optional reference to an external issue (e.g. "org/repo#42") for traceability
+    issue_ref: str | None = None
+
+
+class GoalsConfig(BaseModel):
+    current: list[GoalItem] = []
+
+
+# ---------------------------------------------------------------------------
+# Work sources — external feeds that generate tasks automatically
+# ---------------------------------------------------------------------------
+
+class GitHubIssuesConfig(BaseModel):
+    """Pull open issues from GitHub repos and convert them to tasks.
+
+    Requires ``gh`` CLI to be authenticated (same dependency as PR workflow).
+    """
+    enabled: bool = False
+    repos: list[str] = []
+    labels_include: list[str] = []
+    labels_exclude: list[str] = ["wontfix", "duplicate", "question"]
+    # Hard cap on tasks imported per poll cycle to avoid flooding the queue
+    max_tasks: int = 20
+    # How often (seconds) to re-poll each source between iterations
+    poll_interval: int = 300
+
+
+class WorkSourcesConfig(BaseModel):
+    """External work feeds that populate the task queue automatically."""
+    github_issues: GitHubIssuesConfig = GitHubIssuesConfig()
+    # Paths to markdown PRD / design-doc files to scan for actionable TODOs
+    prd_paths: list[str] = []
+    # Read-only reference documents injected into every iteration prompt
+    context_documents: list[str] = []
 
 
 class ControlsConfig(BaseModel):
@@ -320,6 +389,8 @@ class VigilConfig(BaseModel):
     notifications: NotificationsConfig = NotificationsConfig()
     api: ApiConfig = ApiConfig()
     pr: PRConfig = PRConfig()
+    goals: GoalsConfig = GoalsConfig()
+    work_sources: WorkSourcesConfig = WorkSourcesConfig()
 
 
 def load_config(path: str) -> VigilConfig:
@@ -342,7 +413,7 @@ def load_config(path: str) -> VigilConfig:
         raise ValueError(f"Config file must contain a YAML mapping, got {type(raw).__name__}")
 
     if "project" not in raw:
-        raise ValueError("Config must include a 'project' section with at least 'path'")
+        raw["project"] = {}
 
     try:
         return VigilConfig(**raw)

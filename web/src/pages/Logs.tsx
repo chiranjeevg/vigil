@@ -28,6 +28,8 @@ import {
 import { usePolling } from "@/hooks/usePolling";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { api } from "@/lib/api";
+import { NewProjectLink } from "@/components/NewProjectLink";
+import { PrStatusStrip } from "@/components/PrStatusStrip";
 import {
   pathsEqual,
   type VigilProjectListItem,
@@ -46,11 +48,19 @@ const statusStyles: Record<
   { dot: string; label: string; bg: string }
 > = {
   success: { dot: "bg-green-500", label: "Success", bg: "bg-green-500/10 text-green-400" },
+  merge_conflict: {
+    dot: "bg-orange-500",
+    label: "Merge conflict",
+    bg: "bg-orange-500/10 text-orange-300",
+  },
   no_changes: { dot: "bg-slate-500", label: "No changes", bg: "bg-slate-500/10 text-slate-400" },
   tests_failed: { dot: "bg-red-500", label: "Tests failed", bg: "bg-red-500/10 text-red-400" },
   benchmark_regression: { dot: "bg-amber-500", label: "Regression", bg: "bg-amber-500/10 text-amber-400" },
   safety_revert: { dot: "bg-amber-500", label: "Reverted", bg: "bg-amber-500/10 text-amber-400" },
   llm_error: { dot: "bg-red-500", label: "LLM error", bg: "bg-red-500/10 text-red-400" },
+  config_error: { dot: "bg-red-600", label: "Config error", bg: "bg-red-600/10 text-red-300" },
+  worktree_error: { dot: "bg-red-600", label: "Worktree error", bg: "bg-red-600/10 text-red-300" },
+  dry_run: { dot: "bg-slate-400", label: "Dry run", bg: "bg-slate-400/10 text-slate-300" },
 };
 
 type StatusFilter = "all" | "success" | "failed";
@@ -171,8 +181,20 @@ function IterationCard({
                 >
                   Open full log
                 </Link>
+                <Link
+                  to={`/logs/iteration/${iteration.iteration}${projectQs}#iteration-section-diff`}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:border-slate-400 dark:border-slate-600/60 dark:bg-slate-900/40 dark:text-slate-300 dark:hover:border-slate-500"
+                >
+                  Code diff
+                </Link>
+                <Link
+                  to={`/logs/iteration/${iteration.iteration}${projectQs}#iteration-section-llm`}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:border-slate-400 dark:border-slate-600/60 dark:bg-slate-900/40 dark:text-slate-300 dark:hover:border-slate-500"
+                >
+                  LLM
+                </Link>
               </div>
-              <IterationDetailView detail={detail ?? iteration} loading={false} />
+              <IterationDetailView detail={detail ?? iteration} loading={false} showSectionNav={false} />
             </div>
           )}
         </div>
@@ -247,9 +269,21 @@ export function Logs() {
     void refetchStats();
   }, [selectedProject, refetchStats]);
 
-  useEffect(() => {
+  const loadProjects = useCallback(() => {
     api.getVigilProjects().then((r) => setProjects(r.projects || []));
   }, []);
+
+  useEffect(() => {
+    loadProjects();
+  }, [loadProjects]);
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "visible") loadProjects();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [loadProjects]);
 
   useEffect(() => {
     if (lastEvent?.type === "iteration_complete") {
@@ -296,7 +330,7 @@ export function Logs() {
       {/* Header */}
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0 shrink-0">
-          <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Iteration Logs</h1>
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Iterations</h1>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
             {headerStats ? (
               <>
@@ -321,33 +355,42 @@ export function Logs() {
               "Loading..."
             )}
           </p>
+          <p className="mt-2 max-w-2xl text-xs leading-relaxed text-slate-500 dark:text-slate-500">
+            Browse every run below. Expand a row for a summary, or open the full page for{" "}
+            <strong className="text-slate-700 dark:text-slate-400">timeline</strong>,{" "}
+            <strong className="text-slate-700 dark:text-slate-400">LLM prompts &amp; output</strong>,{" "}
+            <strong className="text-slate-700 dark:text-slate-400">file list</strong>, and{" "}
+            <strong className="text-slate-700 dark:text-slate-400">git diff</strong>. Automated{" "}
+            <code className="font-mono text-[10px]">git push</code> / PRs are configured under Push &amp; PR
+            (or Settings).
+          </p>
         </div>
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white/90 p-2 sm:p-3 dark:border-slate-700/40 dark:bg-slate-900/40">
-            {projects.length > 0 && (
-              <div className="relative min-w-[min(100%,220px)] max-w-full flex-1 basis-[200px] sm:max-w-[280px]">
-                <FolderOpen className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-                <select
-                  value={selectedProject}
-                  onChange={(e) => setSelectedProject(e.target.value)}
-                  className="w-full appearance-none rounded-lg border border-slate-300 bg-white py-2 pl-9 pr-8 text-xs font-medium text-slate-800 outline-none transition-colors hover:border-slate-400 focus:border-blue-500 dark:border-slate-700/50 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:border-slate-600"
-                >
-                  <option value="">
-                    Active project — history + live
+            <NewProjectLink variant="subtle" className="shrink-0 py-2" />
+            <div className="relative min-w-[min(100%,220px)] max-w-full flex-1 basis-[200px] sm:max-w-[280px]">
+              <FolderOpen className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+              <select
+                value={selectedProject}
+                onChange={(e) => setSelectedProject(e.target.value)}
+                className="w-full appearance-none rounded-lg border border-slate-300 bg-white py-2 pl-9 pr-8 text-xs font-medium text-slate-800 outline-none transition-colors hover:border-slate-400 focus:border-blue-500 dark:border-slate-700/50 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:border-slate-600"
+                aria-label="Project for iteration history"
+              >
+                <option value="">
+                  Active project — history + live
+                </option>
+                {projects.map((p) => (
+                  <option key={p.path} value={p.path}>
+                    {p.name}
+                    {" — history"}
+                    {pathsEqual(p.path, daemonStatus?.project_path)
+                      ? " (active)"
+                      : ""}{" "}
+                    ({p.iteration_count} iters)
                   </option>
-                  {projects.map((p) => (
-                    <option key={p.path} value={p.path}>
-                      {p.name}
- — history
-                      {pathsEqual(p.path, daemonStatus?.project_path)
-                        ? " (active)"
-                        : ""}{" "}
-                      ({p.iteration_count} iters)
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
-              </div>
-            )}
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+            </div>
             <span
               className={clsx(
                 "inline-flex h-9 shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-100 px-2.5 text-xs dark:border-slate-700/50 dark:bg-slate-800/50",
@@ -408,6 +451,8 @@ export function Logs() {
             </div>
         </div>
       </div>
+
+      <PrStatusStrip />
 
       {selectedProject && !pathsEqual(selectedProject, daemonStatus?.project_path) && (
         <p className="rounded-lg border border-amber-400/40 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-500/25 dark:bg-amber-500/5 dark:text-amber-200/90">

@@ -211,6 +211,8 @@ Vigil is configured via `vigil.yaml`. See [`vigil.example.yaml`](vigil.example.y
 | `controls` | Safety limits — max iterations, sleep intervals, dry run |
 | `pr` | PR workflow — enable per-iteration GitHub PRs |
 
+**Git & state:** Each iteration runs in a disposable **git worktree** forked from `pr.base_branch` (or `controls.work_branch` when PRs are off), so your main checkout is not switched. Successful branches are merged into `controls.work_branch` via a **merge queue** worktree (conflicts surface as `merge_conflict` in logs). Iteration history lives under **`~/.vigil/state/<id>/`** (legacy `<repo>/.vigil-state/` is migrated once). Requires **Git 2.5+** for `git worktree`.
+
 <details>
 <summary><strong>Example: OpenAI</strong></summary>
 

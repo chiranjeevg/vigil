@@ -16,6 +16,7 @@ import {
   X,
   Trash2,
   ArrowUpDown,
+  FolderPlus,
 } from "lucide-react";
 import clsx from "clsx";
 import { StatCard } from "@/components/StatCard";
@@ -44,11 +45,14 @@ function formatTimeAgo(timestamp: string): string {
 
 const statusColors: Record<string, { bg: string; text: string; label: string }> = {
   success: { bg: "bg-green-500/10", text: "text-green-400", label: "Success" },
+  merge_conflict: { bg: "bg-orange-500/10", text: "text-orange-400", label: "Merge conflict" },
   no_changes: { bg: "bg-slate-500/10", text: "text-slate-400", label: "No changes" },
   tests_failed: { bg: "bg-red-500/10", text: "text-red-400", label: "Tests failed" },
   benchmark_regression: { bg: "bg-orange-500/10", text: "text-orange-400", label: "Regression" },
   safety_revert: { bg: "bg-yellow-500/10", text: "text-yellow-400", label: "Safety revert" },
   llm_error: { bg: "bg-red-500/10", text: "text-red-400", label: "LLM error" },
+  config_error: { bg: "bg-red-600/10", text: "text-red-300", label: "Config error" },
+  worktree_error: { bg: "bg-red-600/10", text: "text-red-300", label: "Worktree error" },
   dry_run: { bg: "bg-blue-500/10", text: "text-blue-400", label: "Dry run" },
 };
 
@@ -295,6 +299,16 @@ export function Dashboard() {
                       ))}
                     </div>
                   )}
+                  <div className="border-t border-slate-200 px-2 py-2 dark:border-slate-700">
+                    <Link
+                      to="/setup"
+                      className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-blue-600 transition-colors hover:bg-slate-100 dark:text-blue-400 dark:hover:bg-slate-700/80"
+                      onClick={() => setShowProjectSelector(false)}
+                    >
+                      <FolderPlus className="h-4 w-4 shrink-0" />
+                      New project wizard
+                    </Link>
+                  </div>
                 </div>
               </div>
             )}

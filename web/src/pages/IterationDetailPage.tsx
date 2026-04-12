@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams, useSearchParams, useLocation } from "react-router-dom";
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import { api } from "@/lib/api";
 import { IterationDetailView } from "@/components/IterationDetailView";
+import { PrStatusStrip } from "@/components/PrStatusStrip";
 import type { Iteration } from "@/types";
 
 /**
@@ -12,6 +13,7 @@ import type { Iteration } from "@/types";
 export function IterationDetailPage() {
   const { iterationNum } = useParams();
   const [searchParams] = useSearchParams();
+  const location = useLocation();
   const projectPath = searchParams.get("project") ?? undefined;
   const num = iterationNum ? parseInt(iterationNum, 10) : NaN;
   const [detail, setDetail] = useState<Iteration | null>(null);
@@ -36,6 +38,16 @@ export function IterationDetailPage() {
       .finally(() => setLoading(false));
   }, [num, projectPath]);
 
+  useEffect(() => {
+    if (loading || !detail) return;
+    const anchor = location.hash.replace(/^#/, "");
+    if (!anchor) return;
+    const t = window.setTimeout(() => {
+      document.getElementById(anchor)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 100);
+    return () => window.clearTimeout(t);
+  }, [detail, loading, location.hash]);
+
   const qs = projectPath ? `?project=${encodeURIComponent(projectPath)}` : "";
   const fullUrl = `${typeof window !== "undefined" ? window.location.origin : ""}/logs/iteration/${num}${qs}`;
 
@@ -47,7 +59,7 @@ export function IterationDetailPage() {
           className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-slate-100 px-3 py-1.5 text-sm text-slate-800 hover:border-slate-400 hover:text-slate-900 dark:border-slate-600/60 dark:bg-slate-800/80 dark:text-slate-300 dark:hover:border-slate-500 dark:hover:text-white"
         >
           <ArrowLeft className="h-4 w-4" />
-          Logs
+          Iterations
         </Link>
         <Link
           to="/"
@@ -74,6 +86,8 @@ export function IterationDetailPage() {
           <p className="mt-1 font-mono text-xs text-slate-600 dark:text-slate-500">{projectPath}</p>
         )}
       </div>
+
+      <PrStatusStrip />
 
       <div className="rounded-xl border border-slate-200 bg-white/90 p-5 dark:border-slate-700/50 dark:bg-slate-800/30">
         <IterationDetailView

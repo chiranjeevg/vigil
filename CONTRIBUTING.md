@@ -82,6 +82,7 @@ Open an [issue](https://github.com/chiranjeevg/vigil/issues/new?labels=enhanceme
    - `ruff check vigil/`
    - `pytest -q` (from repo root, with dev deps installed)
    - `make build-ui` (or `cd web && npm ci && npm run build` — use `make build-ui` to also populate `vigil/ui/` for local `vigil start`)
+   - `cd web && npm test` (Vitest unit tests for shared UI helpers)
 4. Test manually when relevant: `vigil start` and verify behavior
 5. Commit with a clear message
 6. Open a pull request

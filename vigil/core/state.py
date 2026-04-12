@@ -7,6 +7,8 @@ import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from vigil.core.state_paths import external_state_dir, migrate_legacy_vigil_state_if_needed
+
 log = logging.getLogger(__name__)
 
 
@@ -125,7 +127,8 @@ class IterationLog:
 class StateManager:
     def __init__(self, project_path: str):
         self._project_path = project_path
-        self._dir = Path(project_path) / ".vigil-state"
+        self._dir = external_state_dir(project_path)
+        migrate_legacy_vigil_state_if_needed(project_path, self._dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
 
@@ -133,7 +136,6 @@ class StateManager:
         self._tasks_file = self._dir / "tasks.json"
         self._benchmarks_file = self._dir / "benchmarks.json"
         self._iterations_file = self._dir / "iterations.json"
-        self._iterative_branch_file = self._dir / "iterative_branch.json"
 
         for f in (self._tasks_file, self._benchmarks_file, self._iterations_file):
             if not f.exists():
@@ -326,6 +328,18 @@ class StateManager:
         completed = [i for i in iterations if i.get("status") == "success"]
         return completed[-last_n:]
 
+    def get_last_iteration(self) -> dict | None:
+        """Most recently saved iteration (append order matches execution order)."""
+        iterations = self._read_json(self._iterations_file)
+        if not iterations:
+            return None
+        return iterations[-1]
+
+    def get_recent_iterations(self, last_n: int = 10) -> list[dict]:
+        """Return the last *n* iterations in chronological order (oldest first)."""
+        iterations = self._read_json(self._iterations_file)
+        return iterations[-last_n:] if iterations else []
+
     def get_current_focus(self) -> str | None:
         iterations = self._read_json(self._iterations_file)
         if not iterations:
@@ -427,28 +441,9 @@ class StateManager:
         self._write_json(self._tasks_file, tasks)
 
     def get_last_successful_branch(self) -> str | None:
-        """Last successful PR iteration branch name (for chaining after process restart)."""
-        with self._lock:
-            if not self._iterative_branch_file.exists():
-                return None
-            try:
-                data = json.loads(self._iterative_branch_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                return None
-            b = data.get("last_successful_branch")
-            return b if isinstance(b, str) and b.strip() else None
+        """Deprecated: worktree isolation forks each iteration from base; no branch chain."""
+        return None
 
-    def set_last_successful_branch(self, branch: str | None) -> None:
-        """Persist or clear the branch the next iteration should fork from (PR workflow)."""
-        with self._lock:
-            if not branch:
-                if self._iterative_branch_file.exists():
-                    try:
-                        self._iterative_branch_file.unlink()
-                    except OSError:
-                        pass
-                return
-            self._iterative_branch_file.parent.mkdir(parents=True, exist_ok=True)
-            self._iterative_branch_file.write_text(
-                json.dumps({"last_successful_branch": branch}, indent=2)
-            )
+    def set_last_successful_branch(self, _branch: str | None) -> None:
+        """Deprecated: no-op (worktree model does not persist fork chain)."""
+        return

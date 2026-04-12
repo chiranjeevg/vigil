@@ -10,6 +10,9 @@ export interface VigilStatus {
   branch: string;
   project_name?: string;
   project_path?: string;
+  /** controls.work_branch — merge-queue target */
+  merge_branch?: string;
+  merge_queue_head?: string;
 }
 
 export interface Task {
@@ -21,11 +24,15 @@ export interface Task {
 
 export type IterationStatus =
   | "success"
+  | "merge_conflict"
   | "no_changes"
   | "tests_failed"
   | "benchmark_regression"
   | "safety_revert"
-  | "llm_error";
+  | "llm_error"
+  | "config_error"
+  | "worktree_error"
+  | "dry_run";
 
 export interface IterationStep {
   label: string;
@@ -134,6 +141,37 @@ export interface TasksConfig {
   priorities: string[];
   custom: CustomTask[];
   instructions: Record<string, string>;
+  /** "improver" = original behaviour; "engineer" = work-source-driven forward work */
+  priority_mode: "improver" | "engineer";
+}
+
+export interface GoalItem {
+  id: string;
+  description: string;
+  /** 1 = most urgent, 5 = lowest */
+  priority: number;
+  context_files: string[];
+  context_docs: string[];
+  issue_ref: string | null;
+}
+
+export interface GoalsConfig {
+  current: GoalItem[];
+}
+
+export interface GitHubIssuesConfig {
+  enabled: boolean;
+  repos: string[];
+  labels_include: string[];
+  labels_exclude: string[];
+  max_tasks: number;
+  poll_interval: number;
+}
+
+export interface WorkSourcesConfig {
+  github_issues: GitHubIssuesConfig;
+  prd_paths: string[];
+  context_documents: string[];
 }
 
 export interface ControlsConfig {
@@ -170,6 +208,20 @@ export interface PRConfig {
   use_llm_description: boolean;
 }
 
+/** GET /api/pr/status — live git / gh readiness for PR automation */
+export interface PrStatusResponse {
+  enabled: boolean;
+  pr_active: boolean;
+  push_enabled: boolean;
+  gh_pr_enabled: boolean;
+  strategy: string;
+  base_branch: string;
+  preflight_ok: boolean;
+  preflight_message: string;
+  /** HEAD of merge-queue worktree on work_branch (when available) */
+  merge_queue_head?: string;
+}
+
 export interface VigilConfig {
   project: ProjectConfig;
   provider: ProviderConfig;
@@ -178,6 +230,8 @@ export interface VigilConfig {
   tasks: TasksConfig;
   controls: ControlsConfig;
   pr: PRConfig;
+  goals: GoalsConfig;
+  work_sources: WorkSourcesConfig;
 }
 
 export interface SuggestedTask {

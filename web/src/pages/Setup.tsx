@@ -9,7 +9,6 @@ import {
   Check,
   AlertCircle,
   Play,
-  FileCode,
   TestTube,
   BarChart3,
   Settings2,
@@ -23,13 +22,15 @@ import {
   ArrowDown,
   CheckCircle2,
   Brain,
+  Cpu,
   Terminal,
+  StopCircle,
 } from "lucide-react";
 import clsx from "clsx";
-import { api } from "@/lib/api";
+import { api, ApiError, isAbortError, type SetupLlmStatus } from "@/lib/api";
 import type { AnalysisStreamEvent } from "@/lib/api";
-import { useNavigate } from "react-router-dom";
-import type { SuggestedTask } from "@/types";
+import { useNavigate, useLocation, Link } from "react-router-dom";
+import type { SuggestedTask, VigilConfig } from "@/types";
 
 type Step = "select" | "analyze" | "configure" | "ready";
 
@@ -48,8 +49,39 @@ interface Analysis {
   config_files: string[];
 }
 
+function formatSetupLlmLoadError(primary: unknown, secondary?: unknown): string {
+  const parts: string[] = [];
+  if (
+    primary instanceof TypeError ||
+    (primary instanceof Error &&
+      /fetch|network|Failed to fetch|Load failed/i.test(primary.message))
+  ) {
+    parts.push(
+      "Cannot reach the Vigil API. Start the daemon (for example `vigil start` with your vigil.yaml), then open this dashboard from the Vigil server at http://127.0.0.1:7420 — or run `npm run dev` in `web/` so requests proxy to port 7420.",
+    );
+  } else if (primary instanceof ApiError) {
+    parts.push(`${primary.message} (HTTP ${primary.status}).`);
+  } else if (primary instanceof Error) {
+    parts.push(primary.message);
+  } else {
+    parts.push("Could not load LLM status from the server.");
+  }
+  if (secondary != null) {
+    if (secondary instanceof ApiError) {
+      parts.push(`Loading saved config failed: ${secondary.message} (HTTP ${secondary.status}).`);
+    } else if (secondary instanceof Error) {
+      parts.push(`Loading saved config failed: ${secondary.message}`);
+    }
+  }
+  return parts.join(" ");
+}
+
 export function Setup() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const fromSettings = Boolean(
+    (location.state as { fromSettings?: boolean } | null)?.fromSettings,
+  );
   const [step, setStep] = useState<Step>("select");
 
   const [currentPath, setCurrentPath] = useState<string>("");
@@ -77,6 +109,11 @@ export function Setup() {
 
   const [applying, setApplying] = useState(false);
 
+  const [llmStatus, setLlmStatus] = useState<SetupLlmStatus | null>(null);
+  const [llmStatusLoading, setLlmStatusLoading] = useState(true);
+  const [draftModel, setDraftModel] = useState("");
+  const [savingModel, setSavingModel] = useState(false);
+
   interface LogEntry {
     ts: number;
     msg: string;
@@ -85,10 +122,102 @@ export function Setup() {
   const [analysisLogs, setAnalysisLogs] = useState<LogEntry[]>([]);
   const [analysisPhase, setAnalysisPhase] = useState<string>("");
   const logEndRef = useRef<HTMLDivElement>(null);
+  /** Cancels in-flight setup analyze-stream (scan + LLM SSE). */
+  const analysisAbortRef = useRef<AbortController | null>(null);
+  /** Cancels in-flight suggest-tasks (may call LLM). */
+  const taskSuggestAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     loadRecent();
     browse(undefined);
+  }, []);
+
+  const loadLlmStatus = useCallback(async () => {
+    setLlmStatusLoading(true);
+    try {
+      const s = await api.getSetupLlmStatus();
+      setLlmStatus(s);
+    } catch (firstErr) {
+      try {
+        const cfg = await api.getConfig();
+        const p = cfg.provider;
+        if (p && typeof p.type === "string" && p.type.trim()) {
+          const hasModel = Boolean((p.model ?? "").trim());
+          setLlmStatus({
+            ready: hasModel,
+            provider_name: p.type,
+            provider_type: p.type,
+            model: p.model ?? null,
+            message: hasModel
+              ? "Could not query LLM status; using the provider block from the active daemon config. Save provider in Settings if you just changed it, then refresh."
+              : "Provider type is set in vigil.yaml but no model is selected. Open Provider settings, choose a model, save, then refresh below.",
+          });
+          if (hasModel) setDraftModel(p.model as string);
+        } else {
+          throw firstErr;
+        }
+      } catch (secondErr) {
+        setLlmStatus({
+          ready: false,
+          provider_name: null,
+          provider_type: null,
+          model: null,
+          message: formatSetupLlmLoadError(firstErr, secondErr),
+        });
+      }
+    } finally {
+      setLlmStatusLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadLlmStatus();
+  }, [loadLlmStatus]);
+
+  useEffect(() => {
+    if (step === "configure") void loadLlmStatus();
+  }, [step, loadLlmStatus]);
+
+  /** Scan-derived `config` hardcodes Ollama; merge live server provider before Save applies to disk. */
+  const syncProviderFromServer = useCallback(async () => {
+    try {
+      const live = await api.getConfig();
+      setConfig((prev) =>
+        prev ? { ...prev, provider: live.provider } : prev,
+      );
+      setDraftModel(live.provider.model);
+    } catch {
+      /* GET /config can fail if daemon not ready; keep wizard defaults */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step !== "configure" || !selectedPath) return;
+    void syncProviderFromServer();
+  }, [step, selectedPath, syncProviderFromServer]);
+
+  useEffect(() => {
+    if (!llmStatus?.ready) {
+      if (llmStatus && !llmStatus.ready) setDraftModel("");
+      return;
+    }
+    let cancelled = false;
+    api
+      .getConfig()
+      .then((c) => {
+        if (!cancelled) setDraftModel(c.provider.model);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [llmStatus?.ready, llmStatus?.model]);
+
+  useEffect(() => {
+    return () => {
+      analysisAbortRef.current?.abort();
+      taskSuggestAbortRef.current?.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -119,7 +248,19 @@ export function Setup() {
     }
   }
 
+  function abortSetupAnalysis() {
+    analysisAbortRef.current?.abort();
+  }
+
+  function abortTaskSuggestionRefresh() {
+    taskSuggestAbortRef.current?.abort();
+  }
+
   async function selectProject(path: string) {
+    analysisAbortRef.current?.abort();
+    analysisAbortRef.current = new AbortController();
+    const { signal } = analysisAbortRef.current;
+
     setSelectedPath(path);
     setStep("analyze");
     setError(null);
@@ -176,36 +317,80 @@ export function Setup() {
             addLog(`LLM Response: ${d.text.slice(0, 500)}${d.text.length > 500 ? "..." : ""}`, "llm");
             break;
           }
-          case "done":
+          case "done": {
+            // Final payload includes AI-enhanced tasks after LLM completes; `tasks_ready` only
+            // had static suggestions, so we must merge `done` or the first-run wizard looks
+            // like "AI didn't work" until Refresh with AI.
+            const d = evt.data as {
+              suggested?: SuggestedTask[];
+              available?: SuggestedTask[];
+              llm_enhanced?: boolean;
+              config?: Record<string, unknown>;
+            };
+            if (Array.isArray(d.suggested)) setSuggestedTasks(d.suggested);
+            if (Array.isArray(d.available)) setAvailableTasks(d.available);
+            if (typeof d.llm_enhanced === "boolean") setLlmEnhanced(d.llm_enhanced);
+            if (d.config && typeof d.config === "object")
+              setConfig(d.config as Record<string, unknown>);
             setStep("configure");
             break;
+          }
           case "error":
             setError((evt.data as { msg: string }).msg);
             setStep("select");
             break;
         }
-      });
-      if (step !== "configure") {
-        setStep("configure");
+      }, { signal });
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        setAnalysisPhase("Cancelled");
+        setAnalysisLogs((prev) => [
+          ...prev,
+          {
+            ts: Date.now(),
+            msg: "Analysis stopped — connection closed. Any in-flight server work may finish briefly.",
+            level: "info",
+          },
+        ]);
+        setStep("select");
+        return;
       }
-    } catch (e) {
       setError(e instanceof Error ? e.message : "Analysis failed");
       setStep("select");
+    } finally {
+      analysisAbortRef.current = null;
     }
   }
 
   const refreshTaskSuggestions = useCallback(async () => {
     if (!selectedPath) return;
+    taskSuggestAbortRef.current?.abort();
+    taskSuggestAbortRef.current = new AbortController();
+    const { signal } = taskSuggestAbortRef.current;
     setTaskSuggestionsLoading(true);
+    setError(null);
     try {
-      const result = await api.suggestTasks(selectedPath);
+      const result = await api.suggestTasks(selectedPath, {
+        signal,
+        requireLlm: true,
+      });
       setSuggestedTasks(result.suggested);
       setAvailableTasks(result.available);
       setLlmEnhanced(result.llm_enhanced);
-    } catch {
-      // keep existing suggestions
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        return;
+      }
+      const msg =
+        e instanceof ApiError
+          ? `Could not refresh task suggestions (${e.status}): ${e.message}`
+          : e instanceof Error
+            ? e.message
+            : "Could not refresh task suggestions";
+      setError(msg);
     } finally {
       setTaskSuggestionsLoading(false);
+      taskSuggestAbortRef.current = null;
     }
   }, [selectedPath]);
 
@@ -272,8 +457,23 @@ export function Setup() {
     setError(null);
 
     const enabledTasks = suggestedTasks.filter((t) => t.enabled);
+    let live: VigilConfig | null = null;
+    try {
+      live = await api.getConfig();
+    } catch {
+      /* fall back to local `config.provider` + draft model */
+    }
+    const draft = draftModel.trim();
+    const provider: VigilConfig["provider"] = live
+      ? { ...live.provider, ...(draft ? { model: draft } : {}) }
+      : ({
+          ...(config.provider as VigilConfig["provider"]),
+          ...(draft ? { model: draft } : {}),
+        } as VigilConfig["provider"]);
+
     const finalConfig = {
       ...config,
+      provider,
       tasks: {
         priorities: enabledTasks.map((t) => t.type),
         custom: enabledTasks
@@ -321,6 +521,134 @@ export function Setup() {
           Select a project folder and Vigil will analyze it and suggest optimal
           configuration
         </p>
+      </div>
+
+      {fromSettings && (
+        <div className="rounded-xl border border-cyan-500/35 bg-cyan-500/5 px-4 py-3 text-sm text-cyan-950 dark:border-cyan-500/25 dark:bg-cyan-950/20 dark:text-cyan-100/95">
+          You opened this wizard from <strong>Settings</strong>. Configure the LLM under{" "}
+          <strong>Provider</strong> there, click <strong>Save</strong>, then use{" "}
+          <strong>Refresh status</strong> in the card below. You can also jump to{" "}
+          <Link
+            to={{ pathname: "/settings", hash: "#settings-provider" }}
+            state={{ returnTo: "/setup" }}
+            className="font-medium text-cyan-800 underline hover:no-underline dark:text-cyan-300"
+          >
+            Provider in Settings
+          </Link>
+          — after saving, use the <strong>Continue setup</strong> banner at the top of Settings to return here.
+        </div>
+      )}
+
+      <div className="rounded-xl border border-slate-200 bg-white/90 p-4 dark:border-slate-700/50 dark:bg-slate-800/50">
+        <div className="flex flex-wrap items-start gap-3">
+          <Cpu className="mt-0.5 h-5 w-5 shrink-0 text-blue-600 dark:text-blue-400" />
+          <div className="min-w-0 flex-1 space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-semibold text-slate-900 dark:text-white">
+                LLM for AI task suggestions
+              </span>
+              {llmStatusLoading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-500" />
+              ) : llmStatus?.ready ? (
+                <span className="rounded-full bg-green-500/15 px-2 py-0.5 text-[10px] font-medium text-green-700 dark:text-green-400">
+                  Ready
+                </span>
+              ) : (
+                <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-800 dark:text-amber-300">
+                  Not connected
+                </span>
+              )}
+            </div>
+            {!llmStatusLoading && llmStatus && (
+              <>
+                {llmStatus.ready ? (
+                  <p className="text-xs text-slate-600 dark:text-slate-400">
+                    <span className="font-mono">{llmStatus.provider_name ?? "—"}</span>
+                    {llmStatus.provider_type != null && (
+                      <>
+                        {" "}
+                        · {llmStatus.provider_type}
+                        {llmStatus.model ? ` · ${llmStatus.model}` : ""}
+                      </>
+                    )}
+                  </p>
+                ) : (
+                  <p className="text-xs text-amber-800 dark:text-amber-200/90">
+                    {llmStatus.message ??
+                      "Configure an LLM provider to use AI task suggestions."}
+                  </p>
+                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      navigate(
+                        { pathname: "/settings", hash: "#settings-provider" },
+                        { state: { returnTo: "/setup" } },
+                      )
+                    }
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-800 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200"
+                  >
+                    <Settings2 className="h-3.5 w-3.5" />
+                    Provider settings
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void loadLlmStatus()}
+                    className="text-xs text-blue-600 hover:underline dark:text-blue-400"
+                  >
+                    Refresh status
+                  </button>
+                </div>
+                {llmStatus.ready && (
+                  <div className="flex flex-wrap items-end gap-2 pt-1">
+                    <label className="block min-w-[12rem] flex-1">
+                      <span className="mb-1 block text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                        Default model
+                      </span>
+                      <input
+                        value={draftModel}
+                        onChange={(e) => setDraftModel(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-2 py-1.5 font-mono text-xs text-slate-900 dark:border-slate-600 dark:bg-slate-900 dark:text-white"
+                        placeholder="e.g. gpt-4o-mini, llama3.2"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      disabled={savingModel || !draftModel.trim()}
+                      onClick={async () => {
+                        setSavingModel(true);
+                        setError(null);
+                        try {
+                          await api.updateConfig({
+                            provider: { model: draftModel.trim() },
+                          } as Partial<VigilConfig>);
+                          const live = await api.getConfig();
+                          setConfig((prev) =>
+                            prev ? { ...prev, provider: live.provider } : prev,
+                          );
+                          await loadLlmStatus();
+                        } catch (e) {
+                          setError(
+                            e instanceof Error ? e.message : "Failed to update model",
+                          );
+                        } finally {
+                          setSavingModel(false);
+                        }
+                      }}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-blue-600/20 px-3 py-1.5 text-xs font-medium text-blue-700 disabled:opacity-50 dark:text-blue-300"
+                    >
+                      {savingModel ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : null}
+                      Apply
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Progress Steps */}
@@ -471,7 +799,7 @@ export function Setup() {
       {/* Step 2: Analyzing */}
       {step === "analyze" && (
         <div className="space-y-4">
-          <div className="flex items-center gap-4 rounded-xl border border-slate-200 bg-white/90 p-5 dark:border-slate-700/50 dark:bg-slate-800/50">
+          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-200 bg-white/90 p-5 dark:border-slate-700/50 dark:bg-slate-800/50">
             <div className="relative flex-shrink-0">
               <Loader2 className="h-10 w-10 animate-spin text-blue-600 dark:text-blue-400" />
               <Brain className="absolute left-1/2 top-1/2 h-4 w-4 -translate-x-1/2 -translate-y-1/2 text-blue-600 dark:text-blue-300" />
@@ -481,7 +809,19 @@ export function Setup() {
               <p className="mt-0.5 truncate text-xs text-slate-600 dark:text-slate-400">
                 {selectedPath}
               </p>
+              <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-500">
+                Stops the stream and closes the connection. The server may finish one in-flight LLM
+                chunk after cancel.
+              </p>
             </div>
+            <button
+              type="button"
+              onClick={abortSetupAnalysis}
+              className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-700 transition-colors hover:bg-red-500/20 dark:text-red-300 dark:hover:bg-red-500/15"
+            >
+              <StopCircle className="h-4 w-4" />
+              Abort analysis
+            </button>
           </div>
 
           {/* Live log panel */}
@@ -538,6 +878,19 @@ export function Setup() {
       {/* Step 3: Configure */}
       {step === "configure" && config && analysis && (
         <div className="space-y-6">
+          {!llmStatusLoading && llmStatus && !llmStatus.ready && (
+            <div className="flex items-start gap-2 rounded-lg bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100/90">
+              <AlertCircle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div>
+                <p className="font-medium">AI task suggestions are not available</p>
+                <p className="mt-0.5 text-xs opacity-90">
+                  {llmStatus.message ??
+                    "Configure an LLM in the card above or in Provider settings."}{" "}
+                  The Refresh with AI button stays disabled until the server has a working provider.
+                </p>
+              </div>
+            </div>
+          )}
           {/* Analysis Summary */}
           <div className="rounded-xl border border-slate-200 bg-white/90 dark:border-slate-700/50 dark:bg-slate-800/50 p-5">
             <h2 className="mb-4 text-sm font-semibold text-slate-300">
@@ -573,18 +926,38 @@ export function Setup() {
                   </span>
                 )}
               </div>
-              <button
-                onClick={refreshTaskSuggestions}
-                disabled={taskSuggestionsLoading}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-purple-600/20 px-3 py-1.5 text-xs font-medium text-purple-400 transition-colors hover:bg-purple-600/30 disabled:opacity-50"
-              >
-                {taskSuggestionsLoading ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Sparkles className="h-3 w-3" />
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={refreshTaskSuggestions}
+                  disabled={
+                    taskSuggestionsLoading || llmStatusLoading || !llmStatus?.ready
+                  }
+                  title={
+                    !llmStatus?.ready
+                      ? "Configure an LLM provider first (LLM card at top, or Settings)"
+                      : undefined
+                  }
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-purple-600/20 px-3 py-1.5 text-xs font-medium text-purple-400 transition-colors hover:bg-purple-600/30 disabled:opacity-50"
+                >
+                  {taskSuggestionsLoading ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-3 w-3" />
+                  )}
+                  {taskSuggestionsLoading ? "Refreshing..." : "Refresh with AI"}
+                </button>
+                {taskSuggestionsLoading && (
+                  <button
+                    type="button"
+                    onClick={abortTaskSuggestionRefresh}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-red-500/35 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-300"
+                  >
+                    <StopCircle className="h-3 w-3" />
+                    Cancel
+                  </button>
                 )}
-                {taskSuggestionsLoading ? "Refreshing..." : "Refresh with AI"}
-              </button>
+              </div>
             </div>
 
             <p className="mb-4 text-xs text-slate-500">
@@ -849,39 +1222,25 @@ export function Setup() {
               </div>
             </ConfigSection>
 
-            <ConfigSection title="LLM Provider" icon={FileCode}>
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="Provider">
-                  <select
-                    value={
-                      ((config.provider as Record<string, unknown>)
-                        ?.type as string) || "ollama"
-                    }
-                    onChange={(e) =>
-                      updateConfig("provider", "type", e.target.value)
-                    }
-                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white"
-                  >
-                    <option value="ollama">Ollama (Local)</option>
-                    <option value="openai">OpenAI</option>
-                    <option value="anthropic">Anthropic</option>
-                  </select>
-                </Field>
-                <Field label="Model">
-                  <input
-                    type="text"
-                    value={
-                      ((config.provider as Record<string, unknown>)
-                        ?.model as string) || ""
-                    }
-                    onChange={(e) =>
-                      updateConfig("provider", "model", e.target.value)
-                    }
-                    className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm text-slate-900 focus:border-blue-500 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white"
-                  />
-                </Field>
-              </div>
-            </ConfigSection>
+            <div className="rounded-lg border border-slate-200 bg-slate-50/90 px-4 py-3 text-xs leading-relaxed text-slate-600 dark:border-slate-700/60 dark:bg-slate-900/35 dark:text-slate-400">
+              <span className="font-medium text-slate-800 dark:text-slate-200">
+                LLM provider and model
+              </span>{" "}
+              are configured on the server — use the{" "}
+              <strong className="font-medium text-slate-900 dark:text-slate-100">
+                LLM for AI task suggestions
+              </strong>{" "}
+              card at the top of this page (default model + Apply) or{" "}
+              <button
+                type="button"
+                onClick={() => navigate("/settings#settings-provider")}
+                className="font-medium text-blue-600 underline decoration-blue-600/40 underline-offset-2 hover:text-blue-500 dark:text-blue-400 dark:hover:text-blue-300"
+              >
+                Provider settings
+              </button>
+              . This step no longer duplicates those fields, so scanned project defaults cannot
+              clash with your live provider.
+            </div>
 
             <ConfigSection title="Controls" icon={Settings2}>
               <div className="grid grid-cols-2 gap-3">

@@ -47,17 +47,28 @@ class GitManager:
             check=check,
         )
 
-    def ensure_branch(self, branch_name: str) -> None:
+    def ensure_branch(self, branch_name: str) -> bool:
+        """Switch to ``branch_name``, creating it if missing. Returns False on failure."""
         current = self.get_current_branch()
         if current == branch_name:
-            return
+            return True
 
         result = self._run("branch", "--list", branch_name, check=False)
         if branch_name in result.stdout:
-            self._run("checkout", branch_name)
+            co = self._run("checkout", branch_name, check=False)
         else:
-            self._run("checkout", "-b", branch_name)
+            co = self._run("checkout", "-b", branch_name, check=False)
+        if co.returncode != 0:
+            err = (co.stderr or co.stdout or "").strip()
+            log.warning(
+                "Could not switch to branch %r: %s (still on %s)",
+                branch_name,
+                err,
+                self.get_current_branch(),
+            )
+            return False
         log.info("On branch %s", branch_name)
+        return True
 
     def has_changes(self) -> bool:
         result = self._run("status", "--porcelain", check=False)
@@ -77,7 +88,17 @@ class GitManager:
         log.info("Reverted all working tree changes")
 
     def commit(self, message: str) -> None:
-        self._run("add", "-A")
+        # Stage everything, then unstage legacy state dirs if they were ever committed
+        # (iteration state now lives under ~/.vigil/state/).
+        self._run("add", "-A", check=False)
+        self._run(
+            "reset",
+            "HEAD",
+            "--",
+            ".vigil-state",
+            ".vigil-state.migrated",
+            check=False,
+        )
         result = self._run("commit", "-m", message, check=False)
         if result.returncode == 0:
             log.info("Committed: %s", message)
